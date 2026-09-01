@@ -1,0 +1,64 @@
+# Hand-maintained player aliases.
+#
+# This file is not a failure of the resolver -- it is the part of the resolver
+# that a human is better at. Nicknames, mononyms and Portuguese/Brazilian naming
+# conventions are not recoverable by string distance, and guessing at them
+# produces silently wrong joins, which are far more expensive than visible gaps.
+#
+# How entries get here:
+#   1. The loader records an unmatched name in core.resolution_issue.
+#   2. `fplq issues` lists the open ones with their near-miss candidates.
+#   3. A human adds a line here and re-runs the loader.
+#
+# Keys are matched case- and accent-insensitively, so "Sane" finds "Sané".
+# Values must be the canonical `full_name` as it appears in core.player -- i.e.
+# FPL's own "first_name second_name".
+
+aliases:
+  # --- mononyms and nicknames: no string distance recovers these -----------
+  "Rodri": "Rodrigo Hernandez Cascante"
+  "Son": "Heung-Min Son"
+  "Sonny": "Heung-Min Son"
+  "Gabriel": "Gabriel dos Santos Magalhaes"
+  "Gabriel Magalhaes": "Gabriel dos Santos Magalhaes"
+  "Gabriel Jesus": "Gabriel Fernando de Jesus"
+  "Ederson": "Ederson Santana de Moraes"
+  "Alisson": "Alisson Ramses Becker"
+  "Fabinho": "Fabio Henrique Tavares"
+  "Richarlison": "Richarlison de Andrade"
+  "Casemiro": "Carlos Henrique Venancio Casimiro"
+  "Fred": "Frederico Rodrigues de Paula Santos"
+  "Antony": "Antony Matheus dos Santos"
+  "Joelinton": "Joelinton Cassio Apolinario de Lira"
+  "Bruno Guimaraes": "Bruno Guimaraes Rodriguez Moura"
+  "Lucas Paqueta": "Lucas Tolentino Coelho de Lima"
+  "Emerson Royal": "Emerson Aparecido Leite de Souza Junior"
+  "Thiago": "Thiago Alcantara do Nascimento"
+  "Jorginho": "Jorge Luiz Frello Filho"
+  "Willian": "Willian Borges da Silva"
+  "Raphinha": "Raphael Dias Belloli"
+  "Vitinha": "Vitor Machado Ferreira"
+  "Palhinha": "Joao Maria Lobo Alves Palhinha Goncalves"
+  "Diogo Jota": "Diogo Jose Teixeira da Silva"
+  "Bernardo Silva": "Bernardo Mota Veiga de Carvalho e Silva"
+  "Ruben Dias": "Ruben Santos Gato Alves Dias"
+  "Joao Cancelo": "Joao Pedro Cavaco Cancelo"
+  "Bruno Fernandes": "Bruno Miguel Borges Fernandes"
+  "Matheus Cunha": "Matheus Santos Carneiro Da Cunha"
+  "Joao Pedro": "Joao Pedro Junqueira de Jesus"
+
+  # --- ordering differences across sources --------------------------------
+  "Heung-min Son": "Heung-Min Son"
+  "Son Heung-min": "Heung-Min Son"
+  "Min-jae Kim": "Min-Jae Kim"
+
+  # --- transliteration and diacritic variants -----------------------------
+  "Manuel Ugarte": "Manuel Ugarte Ribeiro"
+  "Kaoru Mitoma": "Kaoru Mitoma"
+  "Wataru Endo": "Wataru Endo"
+
+# Names deliberately left unresolved, with a reason. The loader treats these as
+# expected gaps rather than issues, so the open-issue count stays meaningful.
+ignore:
+  - value: "Unknown"
+    reason: "placeholder rows in some archive seasons"
