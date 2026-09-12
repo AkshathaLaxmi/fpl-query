@@ -2,6 +2,8 @@
 
     fplq bootstrap                 create the database, roles and schema
     fplq load --seasons 2024-25    fetch and load seasons from the archive
+    fplq ingest                    fetch a live snapshot and refresh the current season
+    fplq replay --batch-id 12      re-run a past live ingest from raw.document, no fetch
     fplq issues                    list unresolved identity problems
     fplq stats                     row counts, so a load can be sanity-checked
 """
@@ -14,7 +16,7 @@ import secrets
 import sys
 from urllib.parse import quote
 
-from fplq.config import ARCHIVE_SEASONS, REPO_ROOT, require_dsn, settings
+from fplq.config import ARCHIVE_SEASONS, CURRENT_SEASON, REPO_ROOT, require_dsn, settings
 
 log = logging.getLogger("fplq")
 
@@ -177,6 +179,30 @@ def _load(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ingest(args: argparse.Namespace) -> int:
+    from fplq.db import connect
+    from fplq.transform.live import ingest_live
+
+    with connect(require_dsn(settings.writer_dsn, "FPLQ_WRITER_DSN")) as conn:
+        report = ingest_live(conn, args.season)
+    print(report.summary())
+    # A run that writes nothing is the quiet failure the build log calls out:
+    # it looks like success (exit 0, a batch row, no exception) unless
+    # something checks the count. A scheduler can alert on this exit code
+    # without knowing anything about the pipeline's internals.
+    return 1 if report.rows_written == 0 else 0
+
+
+def _replay(args: argparse.Namespace) -> int:
+    from fplq.db import connect
+    from fplq.transform.live import replay_batch
+
+    with connect(require_dsn(settings.writer_dsn, "FPLQ_WRITER_DSN")) as conn:
+        report = replay_batch(conn, args.batch_id)
+    print(report.summary())
+    return 0
+
+
 def _issues(args: argparse.Namespace) -> int:
     from fplq.db import query
 
@@ -237,6 +263,14 @@ def main(argv: list[str] | None = None) -> int:
     load.add_argument("--seasons", nargs="+", metavar="SEASON",
                       help=f"default: {' '.join(ARCHIVE_SEASONS)}")
     load.set_defaults(fn=_load)
+
+    ingest = sub.add_parser("ingest", help="fetch a live snapshot and refresh the current season")
+    ingest.add_argument("--season", default=CURRENT_SEASON)
+    ingest.set_defaults(fn=_ingest)
+
+    replay = sub.add_parser("replay", help="re-run a past live ingest from raw.document")
+    replay.add_argument("--batch-id", type=int, required=True)
+    replay.set_defaults(fn=_replay)
 
     issues = sub.add_parser("issues", help="list unresolved identity problems")
     issues.add_argument("--limit", type=int, default=50)
