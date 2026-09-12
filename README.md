@@ -91,11 +91,14 @@ that manages to send `SET statement_timeout = '1h'; SELECT ...` simply raises
 them. They protect against accidents. They do not protect against a hostile
 query, and this README used to claim otherwise.
 
-What stops the `SET` from arriving is the validator: single statement, `SELECT`
-only, allow-listed tables, forced `LIMIT`, and an `EXPLAIN` cost gate before
-execution. Until that is built, the timeout is enforced client-side as well.
-So the honest picture is one hard layer (privileges), one layer still to build
-(the validator), and a set of sane defaults underneath both.
+What stops the `SET` from arriving is the validator
+([`src/fplq/validate.py`](src/fplq/validate.py)): single statement, `SELECT`
+only, allow-listed schemas, an allow-list of callable functions, a forced
+`LIMIT`, and an `EXPLAIN` cost gate before execution. It parses with `sqlglot`
+rather than matching patterns, and what executes is the statement *regenerated
+from the parsed tree* — so a byte the checks did not see cannot reach the
+server. So the honest picture is two real layers, privileges and the validator,
+with a set of sane defaults underneath both.
 
 Bedrock Guardrails handle abuse and PII; they are not SQL safety and are not
 treated as such.
@@ -170,9 +173,81 @@ Claiming finer resolution than the source has would be inventing precision.
 Requires Python 3.11+ and PostgreSQL 14+ (`btree_gist` is used for the
 exclusion constraint).
 
+### Postgres, if you do not already have it
+
+`fplq bootstrap` needs a running server and a connection that can `CREATE
+ROLE`, `CREATE DATABASE` and `CREATE EXTENSION` — so a superuser, not the
+roles this project creates.
+
+**macOS, Homebrew:**
+
+```bash
+brew install postgresql@17
+brew services start postgresql@17
+# The versioned formula is keg-only, so its binaries are not on PATH until
+# you say so -- without this, psql and pg_isready stay "command not found"
+# even though the install succeeded.
+echo 'export PATH="/opt/homebrew/opt/postgresql@17/bin:$PATH"' >> ~/.zshrc
+exec zsh
+```
+
+Homebrew creates a superuser named after your account rather than one called
+`postgres`. If something later reports that your role does not exist:
+`createuser -s "$(whoami)"`.
+
+**macOS, [Postgres.app](https://postgresapp.com):** install, click Initialize,
+then add its `bin` directory to `PATH` from Preferences → Command Line Tools.
+
+**Debian / Ubuntu:**
+
+```bash
+sudo apt install postgresql postgresql-contrib
+sudo systemctl start postgresql
+```
+
+**Docker**, if you would rather not install a server at all:
+
+```bash
+docker run -d --name fplq-pg -p 5432:5432 \
+    -e POSTGRES_PASSWORD=postgres postgres:17
+```
+
+Check it is up with `pg_isready` before going further.
+
+### Pointing the project at it
+
+The default admin connection assumes a Linux socket
+(`/var/run/postgresql`) and a `postgres` superuser. That is right on Debian and
+wrong nearly everywhere else, which shows up as:
+
+```
+connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed:
+No such file or directory
+```
+
+That message means the DSN, not the server — set `FPLQ_ADMIN_DSN` in `.env`
+to match your install:
+
+```ini
+# macOS (Homebrew or Postgres.app): socket in /tmp, superuser is your account.
+# Write your actual username -- .env is read as literal key=value pairs, so
+# $(whoami) and other shell expansions are not expanded here.
+FPLQ_ADMIN_DSN=postgresql://your-username@/postgres?host=/tmp
+
+# Docker, or any server reached over TCP
+FPLQ_ADMIN_DSN=postgresql://postgres:postgres@localhost:5432/postgres
+```
+
+`.env` is gitignored. `bootstrap` writes the generated writer and reader
+passwords into the same file, so it is worth creating before the first run
+rather than after.
+
+### The project itself
+
 ```bash
 git clone https://github.com/akshathalaxmi/fpl-query
 cd fpl-query
+python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 fplq bootstrap                # creates database, roles and schema, and
@@ -187,8 +262,9 @@ loads inside one transaction, so a half-loaded season is not a state that
 exists. Re-run it freely.
 
 ```bash
-pytest                        # unit tests, no network or database
-pytest -m database            # integration tests against a live Postgres
+pytest -m "not database and not network"   # fast: parsing, resolution, the validator
+pytest -m database                         # integration, against a live Postgres
+pytest                                     # everything, including the two above
 ruff check .
 ```
 
@@ -203,7 +279,8 @@ ruff check .
 - [x] `analytics` views and the read-only execution role
 - [ ] Scheduled ingestion from the live API (EventBridge → Lambda)
 - [ ] Retrieval corpus: schema docs, glossary, few-shot examples
-- [ ] SQL generation on Bedrock, and the validator
+- [x] The SQL validator: parse, allow-list, forced `LIMIT`, cost gate
+- [ ] SQL generation on Bedrock
 - [ ] Golden set and regression runs on every prompt change
 - [ ] Semantic cache, token budget, per-IP limits
 - [ ] Public endpoint
@@ -227,10 +304,21 @@ interpolated into a `LIKE` pattern or a regex, and results are capped. See
 Known limitations, stated rather than implied away:
 
 - The reader's session settings are overridable defaults, not limits — see above.
-- The validator is not built yet, so nothing today rejects multi-statement input.
-  The service is not public until it exists.
+  The validator, not the timeout, is what makes them hard to reach.
 - `analytics.price_as_of()` is `SECURITY DEFINER` with a pinned `search_path`
   and a fixed body; see `sql/006_function_security.sql`.
+- The validator's guarantee is only as good as the parser's view of Postgres.
+  `sqlglot` reads the Postgres dialect but is not Postgres' own grammar, so the
+  design does not depend on it being exhaustive: anything it fails to parse, and
+  anything it parses into a fallback `Command` node, is rejected rather than
+  passed through, and every function name it does not recognise must be on an
+  allow-list. The failure direction is refusal, not execution.
+- The cost gate uses planner estimates, which are estimates. It stops the
+  catastrophic plans, not every slow one; the statement timeout still sits
+  underneath it.
+- Validation covers the SQL. Prompt injection that produces a *legitimate*
+  query the user did not intend is a different problem, handled by Guardrails
+  and the generation prompt rather than here.
 
 If you find something, open an issue.
 

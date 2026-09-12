@@ -142,11 +142,11 @@ def _bootstrap(_: argparse.Namespace) -> int:
     # boundary against a hostile query.
     #
     # The boundary is the grant: fplq_reader has no privilege on core or raw
-    # and no write privilege anywhere, and no SET can change that. The
-    # validator must reject multi-statement input and anything that is not a
-    # single SELECT, which is what stops the SET from arriving in the first
-    # place; until it exists, treat the timeout as advisory and enforce it
-    # client-side as well.
+    # and no write privilege anywhere, and no SET can change that. What stops
+    # the SET from arriving in the first place is the validator in
+    # fplq.validate -- single statement, SELECT only, allow-listed schemas and
+    # functions, forced LIMIT, EXPLAIN cost gate. These settings sit underneath
+    # it as a safety net against accident, which is all they were ever worth.
     with psycopg.connect(settings.admin_dsn, autocommit=True) as admin, admin.cursor() as cur:
         for setting, value in (
             ("statement_timeout", "10s"),
