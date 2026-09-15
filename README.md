@@ -208,8 +208,10 @@ sudo systemctl start postgresql
 **Docker**, if you would rather not install a server at all:
 
 ```bash
+# Pick your own password here -- postgres:postgres is a known default that
+# credential-scanning bots try first against any exposed port.
 docker run -d --name fplq-pg -p 5432:5432 \
-    -e POSTGRES_PASSWORD=postgres postgres:17
+    -e POSTGRES_PASSWORD=change-me postgres:17
 ```
 
 Check it is up with `pg_isready` before going further.
@@ -234,8 +236,9 @@ to match your install:
 # $(whoami) and other shell expansions are not expanded here.
 FPLQ_ADMIN_DSN=postgresql://your-username@/postgres?host=/tmp
 
-# Docker, or any server reached over TCP
-FPLQ_ADMIN_DSN=postgresql://postgres:postgres@localhost:5432/postgres
+# Docker, or any server reached over TCP -- use the password you set above,
+# not "postgres".
+FPLQ_ADMIN_DSN=postgresql://postgres:change-me@localhost:5432/postgres
 ```
 
 `.env` is gitignored. `bootstrap` writes the generated writer and reader
@@ -261,10 +264,23 @@ Loading is idempotent — every write is an upsert on a natural key, and a seaso
 loads inside one transaction, so a half-loaded season is not a state that
 exists. Re-run it freely.
 
+Once a season is loaded, keep the current one fresh from the live API:
+
+```bash
+fplq ingest                   # today's prices, ownership and match results
+fplq replay --batch-id 12     # re-run a past ingest's transform, no re-fetch
+```
+
+`fplq ingest` is meant to run on a schedule (cron, a Lambda, whatever is
+convenient) rather than by hand every day. It exits non-zero if it writes zero
+rows — the quiet failure that a scheduler should alert on, since nothing else
+about that run looks wrong.
+
 ```bash
 pytest -m "not database and not network"   # fast: parsing, resolution, the validator
 pytest -m database                         # integration, against a live Postgres
-pytest                                     # everything, including the two above
+pytest -m "database and network"           # live ingestion, against the real FPL API
+pytest                                     # everything, including the three above
 ruff check .
 ```
 
