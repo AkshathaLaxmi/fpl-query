@@ -218,6 +218,27 @@ def test_season_totals_agree_with_match_rows(reader: psycopg.Connection) -> None
 
 
 @requires_db
+def test_match_rows_sit_in_their_fixtures_gameweek(reader: psycopg.Connection) -> None:
+    """A postponed fixture is played in the gameweek it was moved to.
+
+    The archive lists 2019-20's postponed Man City v Arsenal under both its
+    original gameweek (a blank placeholder) and its rescheduled one; loading the
+    placeholder filed 59 match rows under the wrong gameweek with no goals. A
+    team hosts a given opponent once a season, so (season, home, away) finds
+    the fixture without needing a fixture id.
+    """
+    misfiled = _one(reader, """
+        SELECT count(*) FROM analytics.player_gameweek g
+        JOIN analytics.fixture f
+          ON f.season = g.season
+         AND f.home_team = CASE WHEN g.was_home THEN g.team ELSE g.opponent END
+         AND f.away_team = CASE WHEN g.was_home THEN g.opponent ELSE g.team END
+        WHERE g.gameweek IS DISTINCT FROM f.gameweek
+    """)
+    assert misfiled == 0
+
+
+@requires_db
 def test_every_match_appears_twice_in_team_fixture(reader: psycopg.Connection) -> None:
     """One row per team per fixture is what removes the UNION from every
     upcoming-fixture question."""

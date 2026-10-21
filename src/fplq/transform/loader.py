@@ -424,11 +424,15 @@ class SeasonLoader:
 
         # The archive repeats some (player, fixture) pairs -- exact copies in
         # 2025-26, and in 2019-20 a postponed fixture listed under both its
-        # original and its rescheduled gameweek. Every repeat is an upsert that
-        # lands on a row this load already wrote, so counting executes would
-        # report rows the table does not have. Count distinct keys instead, and
-        # the repeats separately, so the report matches the table.
-        written: set[tuple[int, int]] = set()
+        # original gameweek (a blank placeholder row) and its rescheduled one
+        # (the real match). Upserting every repeat in source order inserted the
+        # placeholder and let the real row patch only a few columns over it --
+        # a hybrid row with real points, no goals and the wrong gameweek. So
+        # pick one row per key first, preferring the one whose gameweek is the
+        # fixture's own, and write each key once. The report counts distinct
+        # keys, and the repeats separately, so it matches the table.
+        chosen: dict[tuple[int, int], dict[str, Any]] = {}
+        fixture_gameweek = self._fixture_gameweeks(season_id)
 
         with self.conn.cursor() as cur:
             for raw in file.rows:
@@ -458,6 +462,28 @@ class SeasonLoader:
                                        f"fixture={row['fpl_fixture_id']}")
                     continue
 
+                key = (player_id, fixture_id)
+                if key not in chosen:
+                    chosen[key] = row
+                else:
+                    report.stat_duplicates += 1
+                    expected = fixture_gameweek.get(fixture_id)
+                    if (gameweek_map.get(chosen[key]["gameweek_number"]) != expected
+                            and gameweek_map.get(gw) == expected):
+                        chosen[key] = row
+
+                # Prices and ownership still come from every row: a placeholder
+                # row carries a real price and ownership for its own deadline.
+                if row["price_at_deadline"] is not None:
+                    prices[player_id].append((gw, float(row["price_at_deadline"])))
+                if row["selected_at_deadline"] is not None:
+                    ownership[player_id].append(
+                        (gw, int(row["selected_at_deadline"]),
+                         row["transfers_in"], row["transfers_out"])
+                    )
+
+            for (player_id, fixture_id), row in chosen.items():
+                gw = row["gameweek_number"]
                 opponent_id = team_map.get(row["opponent_fpl_team_id"]) \
                     if row["opponent_fpl_team_id"] is not None else None
                 # The fact row's team is derived from the fixture, not from the
@@ -491,12 +517,49 @@ class SeasonLoader:
                             %s, %s, %s, %s,
                             %s, %s, %s, %s)
                     ON CONFLICT (player_id, fixture_id) DO UPDATE SET
+                        -- Every non-key column, so a reload replaces a row
+                        -- outright. Updating a subset is how a hybrid row,
+                        -- once written, survives every later reload.
+                        season_id = EXCLUDED.season_id,
+                        gameweek_id = EXCLUDED.gameweek_id,
+                        team_id = EXCLUDED.team_id,
+                        opponent_team_id = EXCLUDED.opponent_team_id,
+                        position_id = EXCLUDED.position_id,
+                        was_home = EXCLUDED.was_home,
+                        kickoff_at = EXCLUDED.kickoff_at,
+                        minutes = EXCLUDED.minutes,
+                        starts = EXCLUDED.starts,
                         total_points = EXCLUDED.total_points,
-                        minutes      = EXCLUDED.minutes,
-                        bonus        = EXCLUDED.bonus,
-                        bps          = EXCLUDED.bps,
-                        price_at_deadline    = EXCLUDED.price_at_deadline,
-                        selected_at_deadline = EXCLUDED.selected_at_deadline
+                        goals_scored = EXCLUDED.goals_scored,
+                        assists = EXCLUDED.assists,
+                        clean_sheets = EXCLUDED.clean_sheets,
+                        goals_conceded = EXCLUDED.goals_conceded,
+                        own_goals = EXCLUDED.own_goals,
+                        penalties_saved = EXCLUDED.penalties_saved,
+                        penalties_missed = EXCLUDED.penalties_missed,
+                        yellow_cards = EXCLUDED.yellow_cards,
+                        red_cards = EXCLUDED.red_cards,
+                        saves = EXCLUDED.saves,
+                        bonus = EXCLUDED.bonus,
+                        bps = EXCLUDED.bps,
+                        influence = EXCLUDED.influence,
+                        creativity = EXCLUDED.creativity,
+                        threat = EXCLUDED.threat,
+                        ict_index = EXCLUDED.ict_index,
+                        expected_goals = EXCLUDED.expected_goals,
+                        expected_assists = EXCLUDED.expected_assists,
+                        expected_goal_involvements = EXCLUDED.expected_goal_involvements,
+                        expected_goals_conceded = EXCLUDED.expected_goals_conceded,
+                        expected_points = EXCLUDED.expected_points,
+                        tackles = EXCLUDED.tackles,
+                        recoveries = EXCLUDED.recoveries,
+                        clearances_blocks_interceptions =
+                            EXCLUDED.clearances_blocks_interceptions,
+                        defensive_contribution = EXCLUDED.defensive_contribution,
+                        price_at_deadline = EXCLUDED.price_at_deadline,
+                        selected_at_deadline = EXCLUDED.selected_at_deadline,
+                        transfers_in = EXCLUDED.transfers_in,
+                        transfers_out = EXCLUDED.transfers_out
                     """,
                     (player_id, season_id, gameweek_map.get(gw), fixture_id, team_id,
                      opponent_id, position_id, row["was_home"], row["kickoff_at"],
@@ -514,22 +577,19 @@ class SeasonLoader:
                      row["price_at_deadline"], row["selected_at_deadline"],
                      row["transfers_in"], row["transfers_out"]),
                 )
-                if (player_id, fixture_id) in written:
-                    report.stat_duplicates += 1
-                else:
-                    written.add((player_id, fixture_id))
-                    report.stats += 1
-
-                if row["price_at_deadline"] is not None:
-                    prices[player_id].append((gw, float(row["price_at_deadline"])))
-                if row["selected_at_deadline"] is not None:
-                    ownership[player_id].append(
-                        (gw, int(row["selected_at_deadline"]),
-                         row["transfers_in"], row["transfers_out"])
-                    )
+                report.stats += 1
 
         self._build_price_history(season_id, prices, deadlines, season_end, report)
         self._build_ownership(season_id, ownership, deadlines, gameweek_map, report)
+
+    def _fixture_gameweeks(self, season_id: int) -> dict[int, int | None]:
+        """fixture_id -> the gameweek the fixture is actually in."""
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT fixture_id, gameweek_id FROM core.fixture WHERE season_id=%s",
+                (season_id,),
+            )
+            return {r["fixture_id"]: r["gameweek_id"] for r in cur.fetchall()}
 
     @staticmethod
     def _team_from_fixture(cur: psycopg.Cursor, fixture_id: int,
