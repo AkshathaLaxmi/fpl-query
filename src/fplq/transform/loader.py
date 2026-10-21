@@ -58,6 +58,7 @@ class LoadReport:
     gameweeks: int = 0
     fixtures: int = 0
     stats: int = 0
+    stat_duplicates: int = 0
     price_intervals: int = 0
     ownership_snapshots: int = 0
     unmatched: list[str] = field(default_factory=list)
@@ -66,7 +67,8 @@ class LoadReport:
         return (
             f"{self.season}: {self.teams} teams, "
             f"{self.players_created} new players ({self.players_linked} linked), "
-            f"{self.fixtures} fixtures, {self.stats} player-match rows, "
+            f"{self.fixtures} fixtures, {self.stats} player-match rows "
+            f"({self.stat_duplicates} duplicate source rows), "
             f"{self.price_intervals} price intervals, "
             f"{len(self.unmatched)} unmatched"
         )
@@ -420,6 +422,14 @@ class SeasonLoader:
         prices: dict[int, list[tuple[int, float]]] = defaultdict(list)
         ownership: dict[int, list[tuple[int, int, int | None, int | None]]] = defaultdict(list)
 
+        # The archive repeats some (player, fixture) pairs -- exact copies in
+        # 2025-26, and in 2019-20 a postponed fixture listed under both its
+        # original and its rescheduled gameweek. Every repeat is an upsert that
+        # lands on a row this load already wrote, so counting executes would
+        # report rows the table does not have. Count distinct keys instead, and
+        # the repeats separately, so the report matches the table.
+        written: set[tuple[int, int]] = set()
+
         with self.conn.cursor() as cur:
             for raw in file.rows:
                 row = parse_gameweek_row(raw)
@@ -504,7 +514,11 @@ class SeasonLoader:
                      row["price_at_deadline"], row["selected_at_deadline"],
                      row["transfers_in"], row["transfers_out"]),
                 )
-                report.stats += 1
+                if (player_id, fixture_id) in written:
+                    report.stat_duplicates += 1
+                else:
+                    written.add((player_id, fixture_id))
+                    report.stats += 1
 
                 if row["price_at_deadline"] is not None:
                     prices[player_id].append((gw, float(row["price_at_deadline"])))
