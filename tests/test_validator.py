@@ -171,6 +171,12 @@ def test_rejects_schemas_outside_the_allow_list(sql: str) -> None:
         "SELECT lo_import('/etc/passwd')",
         "SELECT query_to_xml('SELECT * FROM core.player', true, true, '')",
         "SELECT public.evil(1) FROM analytics.player",
+        # Ours, but resolved by the pipeline before generation, never by the
+        # model: an ambiguous name would otherwise match many players silently.
+        "SELECT analytics.find_player('silva')",
+        "SELECT * FROM analytics.find_player('silva')",
+        "SELECT points FROM analytics.player_season "
+        "WHERE player_id IN (SELECT player_id FROM analytics.find_player('silva'))",
     ],
 )
 def test_rejects_functions_off_the_allow_list(sql: str) -> None:

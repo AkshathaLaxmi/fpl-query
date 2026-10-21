@@ -1,0 +1,239 @@
+# The analytics schema, described for the model.
+#
+# This is the only schema the generator is told about, so it is the only one
+# documented here. Every column of every view must appear below, and nothing
+# may appear that the view does not have: tests/test_corpus.py checks this
+# against the live database, so a migration that changes a view fails the
+# suite until its description changes too.
+#
+# Descriptions are written for a reader who knows football but not this
+# database. Pitfalls are the mistakes that return a confident wrong answer
+# rather than an error, which is the only kind worth warning about.
+
+players: >-
+  Players named in a question are resolved to a player_id before you see the
+  question, and are listed with it ("Mohamed Salah = player_id 306"). Filter on
+  player_id. Never match a name yourself, with equality on player_name or with
+  LIKE on player_search: FPL's short names are not what people type, and a
+  partial name can match many players without any sign that it did.
+
+views:
+  - name: analytics.player_gameweek
+    description: >-
+      One row per player per match played, with player, team, opponent and
+      fixture already joined. Start here for almost any question about what
+      players did.
+    grain: player x fixture
+    pitfalls:
+      - >-
+        A double gameweek gives a player two rows with the same gameweek
+        number. Sum over gameweeks; never assume one row per gameweek.
+      - >-
+        `price` is the price at that gameweek's deadline, not today's price.
+        For the current price use player_season.current_price.
+      - >-
+        Filter players by the player_id you were given, not by player_name
+        ("M.Salah") or player_search.
+      - >-
+        Expected stats (expected_goals and friends) exist from 2022-23 only;
+        tackles, recoveries, clearances_blocks_interceptions and
+        defensive_contribution from 2025-26 only. Earlier seasons hold NULL,
+        not zero.
+    columns:
+      stat_id: Unique id of this player-match row.
+      season: "Season name, 'YYYY-YY' (e.g. '2025-26'). Sorts correctly as text."
+      gameweek: Gameweek number, 1-38.
+      gameweek_deadline: Transfer deadline of the gameweek. The instant to pass to price_as_of() for "at gameweek N".
+      player_id: Stable player id across seasons. Players named in the question arrive as this id.
+      player_name: FPL's short display name, e.g. "M.Salah". Not what a person types.
+      player_full_name: Full name, e.g. "Mohamed Salah".
+      player_search: Search text used by the pipeline's name resolution. Do not filter on it; use player_id.
+      position: "GKP, DEF, MID or FWD. AM is the 2024-25 Assistant Manager chip, not a player."
+      team: Player's team for this match, full name.
+      team_short: Three-letter team code, e.g. ARS.
+      opponent: Opposing team, full name.
+      opponent_short: Opposing team, three-letter code.
+      was_home: True if the player's team was at home.
+      kickoff_at: Kickoff time.
+      fixture_difficulty: FPL fixture difficulty rating for this team in this match, 1 (easiest) to 5 (hardest).
+      price: Price in millions (£m) at the gameweek deadline.
+      selected_by: Number of FPL managers who owned the player at the deadline. A count, not a percentage.
+      points: FPL points scored in this match.
+      minutes: Minutes played. 0 means in the squad but did not play.
+      starts: 1 if the player started the match.
+      goals_scored: Goals scored.
+      assists: Assists.
+      clean_sheets: 1 if the player earned a clean sheet (FPL rule, 60+ minutes, no goals conceded while on the pitch).
+      goals_conceded: Goals the team conceded while the player was on the pitch.
+      own_goals: Own goals.
+      penalties_saved: Penalties saved.
+      penalties_missed: Penalties missed.
+      yellow_cards: Yellow cards.
+      red_cards: Red cards.
+      saves: Saves (goalkeepers).
+      bonus: Bonus points awarded (0-3), already included in `points`.
+      bps: Bonus Points System score that decides `bonus`.
+      influence: ICT influence score.
+      creativity: ICT creativity score.
+      threat: ICT threat score.
+      ict_index: Combined ICT index.
+      expected_goals: Expected goals (xG). From 2022-23.
+      expected_assists: Expected assists (xA). From 2022-23.
+      expected_goal_involvements: xG + xA. From 2022-23.
+      expected_goals_conceded: Expected goals conceded by the team while the player was on. From 2022-23.
+      expected_points: FPL's own pre-match points forecast for this gameweek.
+      tackles: Tackles. From 2025-26.
+      recoveries: Ball recoveries. From 2025-26.
+      clearances_blocks_interceptions: Clearances, blocks and interceptions combined. From 2025-26.
+      defensive_contribution: Defensive actions counted for FPL's defensive-contribution points. From 2025-26.
+      transfers_in: Managers who transferred the player in before this gameweek.
+      transfers_out: Managers who transferred the player out before this gameweek.
+      points_per_million: Points in this match divided by the price paid that week.
+
+  - name: analytics.player_season
+    description: >-
+      Season totals per player, summed from the same match rows as
+      player_gameweek, so a season total never disagrees with its matches.
+    grain: player x season
+    pitfalls:
+      - >-
+        `points_per_million` uses end-of-season (or current) price. For value
+        at a point in time, use player_gameweek or price_as_of().
+      - >-
+        Rank per-minute or per-million stats only with a minutes floor (e.g.
+        minutes >= 900); otherwise a player with one lucky cameo wins.
+    columns:
+      season: "Season name, 'YYYY-YY'."
+      player_id: Stable player id across seasons.
+      player_name: FPL's short display name. Not what a person types.
+      player_full_name: Full name.
+      player_search: Search text used by the pipeline's name resolution. Do not filter on it; use player_id.
+      position: Position that season (GKP, DEF, MID, FWD, AM).
+      team: Team FPL lists for the player at the end of the season (now, for the current season). For the team in a given match, use player_gameweek.team.
+      start_price: Price in £m at the start of the season.
+      current_price: Price in £m at the end of the season, or now for the current season.
+      matches_played: Matches with at least one minute played.
+      starts: Matches started.
+      minutes: Total minutes.
+      points: Total FPL points.
+      goals: Goals scored.
+      assists: Assists.
+      clean_sheets: Clean sheets.
+      goals_conceded: Goals conceded while on the pitch.
+      saves: Saves.
+      bonus: Bonus points.
+      yellow_cards: Yellow cards.
+      red_cards: Red cards.
+      expected_goals: Total xG. NULL before 2022-23.
+      expected_assists: Total xA. NULL before 2022-23.
+      points_per_90: Points per 90 minutes played.
+      points_per_million: Season points divided by current_price.
+
+  - name: analytics.player
+    description: >-
+      One row per player across all seasons. Use it to look a player up;
+      for stats, go to player_gameweek or player_season.
+    grain: player
+    pitfalls:
+      - >-
+        Never match a person's name yourself. Players arrive resolved to a
+        player_id; filter on that.
+    columns:
+      player_id: Stable player id across seasons.
+      player_name: FPL's short display name.
+      full_name: Full name.
+      first_name: First name(s) as FPL records them.
+      last_name: Last name(s) as FPL records them.
+      player_search: Search text used by the pipeline's name resolution. Do not filter on it; use player_id.
+      birth_date: Date of birth, where known.
+      first_season: First season the player appears in.
+      last_season: Most recent season the player appears in.
+      current_team: Team in the player's most recent season.
+
+  - name: analytics.fixture
+    description: One row per match, home and away side by side.
+    grain: fixture
+    pitfalls:
+      - >-
+        For anything about one team's fixtures, use team_fixture instead;
+        here a team appears in either home_team or away_team.
+    columns:
+      fixture_id: Unique match id.
+      season: "Season name, 'YYYY-YY'."
+      gameweek: Gameweek the match belongs to.
+      kickoff_at: Kickoff time.
+      home_team: Home team, full name.
+      home_team_short: Home team, three-letter code.
+      away_team: Away team, full name.
+      away_team_short: Away team, three-letter code.
+      home_score: Home goals. NULL until played.
+      away_score: Away goals. NULL until played.
+      home_difficulty: Difficulty rating of this match for the home team, 1-5.
+      away_difficulty: Difficulty rating of this match for the away team, 1-5.
+      is_finished: True once the match has been played.
+
+  - name: analytics.team_fixture
+    description: >-
+      One row per team per match (two rows per match), from that team's point
+      of view. The shape for fixture-difficulty, upcoming-fixture and
+      goals-for/against questions.
+    grain: team x fixture
+    pitfalls:
+      - >-
+        Every match appears twice. Counting matches across all teams double
+        counts; filter to one team or use analytics.fixture.
+      - >-
+        Upcoming fixtures are `NOT is_finished` in the current season, ordered
+        by gameweek.
+    columns:
+      fixture_id: Match id, shared by the two rows of the same match.
+      season: "Season name, 'YYYY-YY'."
+      gameweek: Gameweek the match belongs to.
+      kickoff_at: Kickoff time.
+      team_id: This team's id.
+      team: This team, full name.
+      team_short: This team, three-letter code.
+      opponent_team_id: Opponent's id.
+      opponent: Opponent, full name.
+      opponent_short: Opponent, three-letter code.
+      is_home: True if this team was at home.
+      difficulty: Difficulty rating of the match for this team, 1 (easiest) to 5 (hardest).
+      goals_for: Goals this team scored. NULL until played.
+      goals_against: Goals this team conceded. NULL until played.
+      is_finished: True once the match has been played.
+
+  - name: analytics.player_price_history
+    description: >-
+      Every price a player has had, as intervals: the price held from
+      valid_from until valid_to.
+    grain: player x price interval
+    pitfalls:
+      - >-
+        For the price at one instant, call analytics.price_as_of() rather
+        than writing the interval comparison by hand.
+      - >-
+        Seasons loaded from the archive change price at most once per
+        gameweek, so the price "on a Tuesday" means that gameweek's price.
+    columns:
+      player_id: Stable player id.
+      player_name: FPL's short display name.
+      season: Season the interval belongs to.
+      price: Price in £m during the interval.
+      valid_from: Start of the interval (inclusive).
+      valid_to: End of the interval (exclusive). NULL means the price is still current.
+
+functions:
+  - name: analytics.price_as_of(player_id integer, as_of timestamptz)
+    returns: numeric
+    description: >-
+      The price in £m a player carried at an instant. NULL if they had no
+      price then (before their first season, or between spells).
+    usage: >-
+      For "at gameweek N", pass that gameweek's gameweek_deadline from
+      player_gameweek. Never use current_price for a past point in time.
+
+# The other analytics functions are not described here. find_player is what
+# the pipeline uses to resolve names before generation, and the validator
+# refuses it in generated SQL. fold_name, like_literal and player_search_text
+# are internal helpers behind it. Describing them would only invite the model
+# to use them.
