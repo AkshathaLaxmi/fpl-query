@@ -1,4 +1,5 @@
-"""The archive loader's row counts.
+"""The archive loader's bookkeeping: row counts, the batch ledger, and the
+price-history handoff to live ingestion.
 
 The build log's lesson is that matching counts are not the same as a correct
 load -- but a count that does not match the table is worse, because it is the
@@ -13,8 +14,10 @@ loader's bookkeeping, not Postgres's ON CONFLICT.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
+
+import pytest
 
 from fplq.ingest.archive import ArchiveFile
 from fplq.transform.loader import LoadReport, SeasonLoader
@@ -25,8 +28,10 @@ _FIXTURE_GAMEWEEKS = {9275: 139, 9276: 130}
 
 
 class _FakeCursor:
-    def __init__(self, log: list[tuple[str, object]]) -> None:
+    def __init__(self, log: list[tuple[str, object]],
+                 live_from: dict[int, datetime]) -> None:
         self.log = log
+        self.live_from = live_from
         self._last = ""
 
     def __enter__(self) -> _FakeCursor:
@@ -40,20 +45,29 @@ class _FakeCursor:
         self._last = sql
 
     def fetchone(self) -> dict[str, Any]:
-        return {"home_team_id": 1, "away_team_id": 2}
+        return {"home_team_id": 1, "away_team_id": 2, "season_id": 1, "batch_id": 7}
 
     def fetchall(self) -> list[dict[str, Any]]:
         if "FROM core.fixture" in self._last:
             return [{"fixture_id": f, "gameweek_id": g} for f, g in _FIXTURE_GAMEWEEKS.items()]
+        if "source <> 'fpl_archive'" in self._last:
+            return [{"player_id": p, "live_from": t} for p, t in self.live_from.items()]
         return []
 
 
 class _FakeConn:
-    def __init__(self) -> None:
+    def __init__(self, live_from: dict[int, datetime] | None = None) -> None:
         self.executed: list[tuple[str, object]] = []
+        self.live_from = live_from or {}
 
     def cursor(self) -> _FakeCursor:
-        return _FakeCursor(self.executed)
+        return _FakeCursor(self.executed, self.live_from)
+
+    def commit(self) -> None:
+        self.executed.append(("COMMIT", None))
+
+    def rollback(self) -> None:
+        self.executed.append(("ROLLBACK", None))
 
 
 def _gw_row(element: int, fixture: int, gw: int, *,
@@ -140,3 +154,76 @@ def test_reload_replaces_every_column() -> None:
 def test_no_duplicates_reports_zero() -> None:
     report, _ = _stats_report([_gw_row(10, 275, 29), _gw_row(11, 276, 30)])
     assert (report.stats, report.stat_duplicates) == (2, 0)
+
+
+# --- the batch ledger --------------------------------------------------------
+
+
+def test_a_failed_load_keeps_its_batch_row() -> None:
+    """The batch row is committed before the work, so the rollback of a failed
+    season cannot take it along -- and marking it failed has a row to update."""
+    conn = _FakeConn()
+    with pytest.raises(KeyError):
+        SeasonLoader(conn).load_season("2019-20", {})  # type: ignore[arg-type]
+    steps = [sql.split()[0] if sql not in ("COMMIT", "ROLLBACK") else sql
+             for sql, _ in conn.executed]
+    opened = next(i for i, (sql, _) in enumerate(conn.executed)
+                  if "INSERT INTO raw.ingest_batch" in sql)
+    assert steps[opened + 1] == "COMMIT"
+    assert steps.index("ROLLBACK") > opened + 1
+    assert any("status=%s" in sql and params[0] == "failed"  # type: ignore[index]
+               for sql, params in conn.executed if params)
+
+
+# --- the price handoff -------------------------------------------------------
+
+_GW1 = datetime(2026, 8, 21, 18, 0, tzinfo=UTC)
+_GW2 = _GW1 + timedelta(days=7)
+_GW3 = _GW2 + timedelta(days=7)
+
+
+def _rebuilt_intervals(live_from: dict[int, datetime]) -> list[tuple[Any, ...]]:
+    conn = _FakeConn(live_from)
+    SeasonLoader(conn)._build_price_history(  # type: ignore[arg-type]
+        season_id=1, prices={100: [(1, 7.0), (2, 7.0), (3, 7.1)]},
+        deadlines={1: _GW1, 2: _GW2, 3: _GW3}, season_end=None,
+        report=LoadReport(season="2026-27"),
+    )
+    return [params for sql, params in conn.executed  # type: ignore[misc]
+            if "INSERT INTO core.player_price_history" in sql]
+
+
+def test_without_live_data_the_current_season_stays_open() -> None:
+    intervals = _rebuilt_intervals({})
+    assert [(p[2], p[3], p[4]) for p in intervals] == [(7.0, _GW1, _GW3), (7.1, _GW3, None)]
+
+
+def test_a_reload_after_live_ingest_hands_off_at_the_live_start() -> None:
+    """Live took over between GW1 and GW3: the archive closes there, and the
+    GW3 interval -- which live already owns -- is not rebuilt at all."""
+    live = _GW2 + timedelta(hours=5)
+    intervals = _rebuilt_intervals({100: live})
+    assert [(p[2], p[3], p[4]) for p in intervals] == [(7.0, _GW1, live)]
+
+
+def test_live_data_for_another_player_does_not_clip_this_one() -> None:
+    intervals = _rebuilt_intervals({200: _GW1})
+    assert [(p[2], p[3], p[4]) for p in intervals] == [(7.0, _GW1, _GW3), (7.1, _GW3, None)]
+
+
+def test_archive_ownership_is_rebuilt_not_only_upserted() -> None:
+    """Live ingestion corrects a derived deadline; an upsert-only reload then
+    left the old snapshot at the stale instant beside the new one."""
+    conn = _FakeConn()
+    SeasonLoader(conn)._build_ownership(  # type: ignore[arg-type]
+        season_id=1, ownership={100: [(1, 5000, None, None)]},
+        deadlines={1: _GW1}, gameweek_map={1: 101}, report=LoadReport(season="2026-27"),
+    )
+    sqls = [sql for sql, _ in conn.executed]
+    delete = next(i for i, sql in enumerate(sqls)
+                  if "DELETE FROM core.player_ownership_snapshot" in sql)
+    insert = next(i for i, sql in enumerate(sqls)
+                  if "INSERT INTO core.player_ownership_snapshot" in sql)
+    assert delete < insert
+    # Only the archive's gameweek-grained rows: live snapshots have no gameweek.
+    assert "gameweek_id IS NOT NULL" in sqls[delete]

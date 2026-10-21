@@ -29,14 +29,14 @@ run for a player takes over that same open interval -- closing it and
 opening a new one -- rather than inserting a second, competing one. See
 `_refresh_price` below.
 
-That handoff is one-directional. Re-running `fplq load` for a season *after*
-live ingestion has moved a player's price is not yet reconciled here: the
-archive loader rebuilds a season's `source='fpl_archive'` rows from scratch
-and leaves any later `source='fpl'` row untouched, so if the archive's
-rebuilt last interval and a live interval both end up open, the exclusion
-constraint will (correctly) refuse the second insert. That is a real,
-undecided interaction, not a hidden one: the fix is to make the archive
-reload season-current-aware, and it is not built yet.
+The handoff also holds in the other direction. Re-running `fplq load` for
+the current season *after* live ingestion rebuilds the season's
+`source='fpl_archive'` rows from scratch, and that rebuild closes each
+player's archive history at the start of their first live interval -- the
+same instant this module closed it at -- and does not rebuild anything after
+it (see `SeasonLoader._build_price_history`). Without that, the rebuilt open
+interval and the live one would both be open and the exclusion constraint
+would (correctly) refuse the whole season.
 """
 
 from __future__ import annotations
@@ -193,7 +193,11 @@ class LiveLoader:
                 "VALUES ('fpl_api', %s, %s) RETURNING batch_id",
                 (endpoint, season),
             )
-            return cur.fetchone()["batch_id"]
+            batch_id = cur.fetchone()["batch_id"]
+        # Committed before any work, so the rollback on failure cannot take the
+        # batch row with it -- otherwise a failed run leaves no ledger entry.
+        self.conn.commit()
+        return batch_id
 
     def _close_batch(self, batch_id: int, *, row_count: int,
                      status: str = "succeeded", error: str | None = None) -> None:
