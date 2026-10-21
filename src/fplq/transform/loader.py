@@ -97,7 +97,13 @@ class SeasonLoader:
                  file.content_sha256 if file else None,
                  len(file.rows) if file else None),
             )
-            return cur.fetchone()["batch_id"]
+            batch_id = cur.fetchone()["batch_id"]
+        # Committed on its own, before any work. Opened inside the season's
+        # transaction, the rollback on failure took the batch row with it, and
+        # marking it failed afterwards updated nothing -- so a failed load left
+        # no trace in the ledger at all.
+        self.conn.commit()
+        return batch_id
 
     def _close_batch(self, batch_id: int, *, status: str = "succeeded",
                      error: str | None = None) -> None:
@@ -222,9 +228,12 @@ class SeasonLoader:
                 # inputs. Row counts matched, so "idempotent" looked true while
                 # the content was not.
                 #
-                # Seasons load in ascending order, so writing every time means the
-                # most recent season wins, which is the name a person would use
-                # today. Registration history stays in player_season regardless.
+                # The most recent season's name wins -- the name a person would
+                # use today. That used to rely on seasons loading in ascending
+                # order, so reloading 2019-20 on its own turned "M.Salah" back
+                # into "Salah". The WHERE makes it explicit instead: a season
+                # only rewrites the name if no later season registers the
+                # player. Registration history stays in player_season regardless.
                 if player_id is None:
                     report.players_created += 1
                 else:
@@ -244,16 +253,25 @@ class SeasonLoader:
                             normalised_name = EXCLUDED.normalised_name,
                             birth_date      = COALESCE(EXCLUDED.birth_date,
                                                        core.player.birth_date)
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM core.player_season ps
+                            JOIN core.season later ON later.season_id = ps.season_id
+                            WHERE ps.player_id = core.player.player_id
+                              AND later.start_year >
+                                  (SELECT start_year FROM core.season WHERE season_id = %s))
                     RETURNING player_id
                     """,
                     (code, row["first_name"], row["last_name"],
                      row["display_name"], full_name, name_key(full_name),
-                     row["birth_date"]),
+                     row["birth_date"], season_id),
                 )
-                returned = cur.fetchone()["player_id"]
+                # No row back means the WHERE kept a later season's name; the
+                # player is one we already know, so keep the id we have.
+                returned = cur.fetchone()
                 # For a code-less player matched by name the upsert has no
                 # conflict target to hit, so keep the id the resolver chose.
-                player_id = returned if code is not None else player_id
+                if code is not None and returned is not None:
+                    player_id = returned["player_id"]
                 if code is not None:
                     code_index[code] = player_id
 
@@ -657,6 +675,25 @@ class SeasonLoader:
             # is it safe -- and correct -- to close the final interval.
             season_over = season_end is not None and season_end < datetime.now(UTC)
 
+            # The handoff to live ingestion, in the reload direction. Once the
+            # live loader has seen a player it owns their price from that
+            # moment: it closed the archive's open interval there and opened its
+            # own. The delete above removed that closed archive row, so a
+            # rebuild must close it at the same instant again, or the rebuilt
+            # open interval overlaps the live one and the exclusion constraint
+            # (rightly) rejects the whole season.
+            cur.execute(
+                """
+                SELECT player_id, min(valid_from) AS live_from
+                FROM core.player_price_history
+                WHERE source <> 'fpl_archive'
+                GROUP BY player_id
+                """
+            )
+            live_from: dict[int, datetime] = {
+                r["player_id"]: r["live_from"] for r in cur.fetchall()
+            }
+
             for player_id, observations in prices.items():
                 runs: list[tuple[int, int, float]] = []   # (from_gw, to_gw, price)
                 for gw, price in sorted(set(observations)):
@@ -676,6 +713,13 @@ class SeasonLoader:
                         # Last run of the season: close it if the season is done,
                         # leave it open if the season is still being played.
                         valid_to = season_end if season_over else None
+
+                    cutoff = live_from.get(player_id)
+                    if cutoff is not None:
+                        if valid_from >= cutoff:
+                            continue
+                        if valid_to is None or valid_to > cutoff:
+                            valid_to = cutoff
 
                     if valid_to is not None and valid_to <= valid_from:
                         continue
@@ -701,6 +745,17 @@ class SeasonLoader:
                          gameweek_map: dict[int, int],
                          report: LoadReport) -> None:
         with self.conn.cursor() as cur:
+            # Rebuild the archive's own snapshots, like the price history. They
+            # sit at gameweek deadlines, and live ingestion corrects a derived
+            # deadline to the real one -- so upserting alone left the old
+            # snapshot behind at the stale instant, two GW1 rows per player.
+            # The archive's rows are the gameweek-grained ones; live snapshots
+            # carry no gameweek_id and are left alone.
+            cur.execute(
+                "DELETE FROM core.player_ownership_snapshot "
+                "WHERE season_id=%s AND gameweek_id IS NOT NULL",
+                (season_id,),
+            )
             for player_id, observations in ownership.items():
                 for gw, selected, transfers_in, transfers_out in sorted(set(observations)):
                     snapshot_at = deadlines.get(gw)
