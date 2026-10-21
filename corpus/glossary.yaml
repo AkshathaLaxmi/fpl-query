@@ -1,0 +1,218 @@
+# FPL vocabulary, mapped onto the analytics schema.
+#
+# Each term says what an FPL player means by it and how to compute it here.
+# Where the data cannot support the term, `in_data: false` says so and
+# `instead` gives the honest alternative, so the generator declines or labels
+# its answer rather than answering a neighbouring question as if it were the
+# one asked.
+#
+# Thresholds marked "convention" are community habits, not FPL rules. When an
+# answer uses one, it should say which threshold it used.
+
+terms:
+  - term: points per million
+    aliases: [PPM, value, bang for buck]
+    meaning: FPL points divided by the player's price in £m. The standard measure of value.
+    compute: >-
+      Season value: player_season.points_per_million (uses current price).
+      Value at a point in time: points over a window divided by
+      price_as_of() at the start of that window.
+    in_data: true
+
+  - term: price
+    aliases: [cost, "their value", £m]
+    meaning: What a player costs to buy in FPL, in £m, e.g. 14.5.
+    compute: >-
+      Now: player_season.current_price for the current season. At a past
+      gameweek: price_as_of(player_id, gameweek_deadline), or
+      player_gameweek.price for a gameweek they played in.
+    in_data: true
+
+  - term: price rise / price fall
+    aliases: [riser, faller, price change]
+    meaning: FPL moves prices up or down by £0.1m in response to transfers.
+    compute: >-
+      Consecutive rows in player_price_history for the player, ordered by
+      valid_from; a rise is a row whose price is higher than the previous one.
+    in_data: true
+
+  - term: ownership
+    aliases: [selected by, owned by, TSB]
+    meaning: How many FPL managers have the player in their team.
+    compute: >-
+      player_gameweek.selected_by is a COUNT of managers at that deadline. The
+      total number of managers is not in the data, so ownership as a
+      percentage cannot be computed; rank by the count instead and say so.
+    in_data: true
+
+  - term: differential
+    aliases: [diff, low-owned pick]
+    meaning: >-
+      A player few managers own, so their points move you up the rankings.
+      Usually "under 5-10% owned" (convention).
+    compute: >-
+      Ownership percentages are not in the data. Use a low selected_by count
+      at the latest deadline, state the cut-off used, and say it is a count of
+      managers rather than a percentage.
+    in_data: partial
+
+  - term: template
+    aliases: [template player, essential]
+    meaning: A player owned by a large share of managers, the opposite of a differential.
+    compute: Highest selected_by at the latest deadline, with the same caveat as differential.
+    in_data: partial
+
+  - term: double gameweek
+    aliases: [DGW]
+    meaning: A gameweek in which a team plays twice, so its players can score twice.
+    compute: >-
+      Teams with two rows in team_fixture for the same season and gameweek.
+      In player_gameweek a player has two rows for that gameweek.
+    in_data: true
+
+  - term: blank gameweek
+    aliases: [BGW, blank (team)]
+    meaning: A gameweek in which a team has no match, usually because of a cup clash.
+    compute: >-
+      Season gameweeks (from fixture) with no team_fixture row for the team.
+      Whole-league blanks also exist: 2022-23 has 37 gameweeks because
+      gameweek 7 was postponed.
+    in_data: true
+
+  - term: blank (player)
+    aliases: [blanked]
+    meaning: A player who played but scored no returns, typically 2 points or fewer (convention).
+    compute: player_gameweek rows with minutes > 0 and points <= 2.
+    in_data: true
+
+  - term: returns
+    aliases: [attacking returns, return]
+    meaning: Goals and assists; for defenders and goalkeepers clean sheets count too.
+    compute: goals_scored + assists, plus clean_sheets for GKP and DEF.
+    in_data: true
+
+  - term: haul
+    aliases: [big haul]
+    meaning: A big score in one gameweek, usually 10 points or more (convention).
+    compute: Sum of player_gameweek.points for the gameweek (a double gameweek has two rows) >= 10.
+    in_data: true
+
+  - term: fixture difficulty
+    aliases: [FDR, fixtures, fixture run, easy fixtures]
+    meaning: FPL's 1-5 rating of how hard a match is, 1 being easiest.
+    compute: >-
+      team_fixture.difficulty for that team; "good fixtures" means a low
+      average over the next N unfinished matches, ordered by gameweek.
+    in_data: true
+
+  - term: form
+    aliases: [in form, hot streak]
+    meaning: >-
+      FPL's form figure is average points over the last 30 days. Fans use it
+      loosely for recent scoring.
+    compute: >-
+      FPL's own form figure is not stored. Use average points per match over
+      the player's last 4-5 gameweeks (convention) and say that is the
+      definition used.
+    in_data: partial
+
+  - term: nailed
+    aliases: [nailed on, guaranteed starter, rotation risk (opposite)]
+    meaning: A player who reliably starts.
+    compute: >-
+      Share of their team's recent matches the player started (starts), or
+      average minutes per match. State the window.
+    in_data: true
+
+  - term: bonus points
+    aliases: [bonus, BPS]
+    meaning: >-
+      Up to 3 extra points per match for the best performers, decided by the
+      Bonus Points System score.
+    compute: >-
+      player_gameweek.bonus (already inside points); bps is the underlying
+      score.
+    in_data: true
+
+  - term: expected goals
+    aliases: [xG, xA, xGI, underlying numbers, underlying stats]
+    meaning: >-
+      The quality of chances a player had or created, in goals. xGI is xG
+      plus xA.
+    compute: >-
+      expected_goals, expected_assists, expected_goal_involvements. Only from
+      2022-23; earlier seasons are NULL, and a question about them must say
+      the data does not cover them.
+    in_data: partial
+
+  - term: defensive contribution
+    aliases: [DefCon, CBIT, defensive points]
+    meaning: >-
+      Points FPL awards from 2025-26 for defensive actions (clearances,
+      blocks, interceptions, tackles and, for midfielders and forwards,
+      recoveries).
+    compute: player_gameweek.defensive_contribution and its components. From 2025-26 only.
+    in_data: partial
+
+  - term: clean sheet
+    aliases: [CS, shutout]
+    meaning: >-
+      No goals conceded while the player was on the pitch, having played 60+
+      minutes. Worth points to goalkeepers, defenders and midfielders.
+    compute: player_gameweek.clean_sheets, or team_fixture.goals_against = 0 for the team.
+    in_data: true
+
+  - term: points per 90
+    aliases: [per 90, p90]
+    meaning: Points scaled to a full match, so part-time players can be compared.
+    compute: player_season.points_per_90; always pair with a minutes floor.
+    in_data: true
+
+  - term: position
+    aliases: [GKP, goalkeeper, DEF, defender, MID, midfielder, FWD, forward, striker]
+    meaning: FPL's position for the player, which decides how they score points.
+    compute: >-
+      position column: GKP, DEF, MID, FWD. AM is the 2024-25 Assistant
+      Manager chip and should be excluded from player questions.
+    in_data: true
+
+  - term: current season
+    aliases: [this season, this year]
+    meaning: The season in progress.
+    compute: >-
+      The latest season in the data (max(season)). If it has barely started,
+      say so; "last season" is the one before it.
+    in_data: true
+
+  - term: captain
+    aliases: [captaincy, armband, vice captain, C, VC]
+    meaning: The player whose points a manager doubles.
+    compute: Not in the data. Manager teams, captain picks and chips are not ingested.
+    in_data: false
+    instead: >-
+      Say captaincy picks are not in the data. A question about who scores
+      the most can be answered from points, labelled as that.
+
+  - term: chips
+    aliases: [wildcard, free hit, bench boost, triple captain]
+    meaning: One-off FPL powers a manager can play.
+    compute: Not in the data. No manager-level data is ingested.
+    in_data: false
+    instead: Say chip usage is not in the data. Double and blank gameweeks, which drive chip timing, are.
+
+  - term: mini-league
+    aliases: [league, rank, overall rank, OR, my team]
+    meaning: A manager's own team, rankings and leagues.
+    compute: Not in the data. The service answers questions about players and teams, not about any manager.
+    in_data: false
+    instead: Say manager and league data are not available.
+
+  - term: goal timing
+    aliases: [late goals, goals in the last 15 minutes, first half goals]
+    meaning: When in a match goals were scored.
+    compute: Not in the data. The feed records goals per match, not per minute.
+    in_data: false
+    instead: >-
+      Say minute-level timings are not available. Goals for or against per
+      match is a different question, and may be offered only if labelled as
+      one.

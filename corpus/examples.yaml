@@ -1,0 +1,244 @@
+# Worked examples: question in, behaviour out.
+#
+# These are the few-shot examples retrieval serves, and the seed of the golden
+# set (FPL-17). They replace docs/example-queries.sql, so there is one copy to
+# keep true rather than two to keep in step.
+#
+# Three kinds, because the right response to a question is not always SQL:
+#
+#   answer   - SQL that answers it. Must pass the validator and run as
+#              fplq_reader; tests/test_corpus.py executes every one.
+#   clarify  - the question cannot be answered until the user says which thing
+#              they meant. No SQL.
+#   refuse   - the data cannot answer it. Says why, and may offer a labelled
+#              alternative, which is a different question and must say so.
+#
+# `players` lists the names the pipeline resolved with find_player() before
+# generation, as the model will see them. The test re-resolves each name and
+# fails if it no longer maps to the same id, so an example cannot quietly
+# start teaching the wrong player.
+#
+# `ambiguous_name` on a clarify example is checked the same way: the test
+# fails if find_player() stops finding several equally good matches for it.
+#
+# `teaches` is the reason the example is in the corpus. An example that
+# teaches nothing the others do not is noise in the prompt.
+
+examples:
+  - id: cheap-defenders-fixtures
+    kind: answer
+    question: Which defenders under £5.0m have the best fixtures over the next four gameweeks?
+    teaches:
+      - '"This season" is the latest season in the data, not a hard-coded year.'
+      - Upcoming fixtures come from team_fixture, NOT is_finished, ordered by gameweek.
+      - Current price comes from player_season.current_price.
+    sql: |
+      WITH current_season AS (
+          SELECT MAX(season) AS season FROM analytics.fixture
+      ),
+      next_four AS (
+          SELECT team,
+                 AVG(difficulty)::numeric(3,2) AS avg_difficulty,
+                 string_agg(opponent_short || CASE WHEN is_home THEN ' (H)' ELSE ' (A)' END,
+                            ', ' ORDER BY gameweek) AS run
+          FROM (
+              SELECT tf.*, ROW_NUMBER() OVER (PARTITION BY tf.team ORDER BY tf.gameweek) AS rn
+              FROM analytics.team_fixture tf
+              JOIN current_season cs ON tf.season = cs.season
+              WHERE NOT tf.is_finished
+          ) upcoming
+          WHERE rn <= 4
+          GROUP BY team
+      ),
+      cheap_defenders AS (
+          SELECT s.player_name, s.team, s.current_price
+          FROM analytics.player_season s
+          JOIN current_season cs ON s.season = cs.season
+          WHERE s.position = 'DEF' AND s.current_price < 5.0
+      )
+      SELECT d.player_name, d.team, d.current_price, f.avg_difficulty, f.run
+      FROM cheap_defenders d
+      JOIN next_four f ON f.team = d.team
+      ORDER BY f.avg_difficulty, d.current_price
+      LIMIT 10
+
+  - id: midfielder-value-last-season
+    kind: answer
+    question: Who had the most points per million among midfielders last season?
+    teaches:
+      - Value questions rank by points_per_million from player_season.
+      - Per-million and per-90 rankings need a minutes floor, stated in the answer.
+    sql: |
+      SELECT player_name, team, points, current_price, points_per_million
+      FROM analytics.player_season
+      WHERE season = '2025-26' AND position = 'MID' AND minutes >= 900
+      ORDER BY points_per_million DESC
+      LIMIT 10
+
+  - id: salah-saka-home-away
+    kind: answer
+    question: Compare Salah and Saka's home vs away returns since 2023/24.
+    players:
+      - {name: Mohamed Salah, player_id: 306}
+      - {name: Bukayo Saka, player_id: 31}
+    teaches:
+      - Resolved players are filtered by player_id.
+      - "Seasons compare as text: '2023-24' <= season works because 'YYYY-YY' sorts correctly."
+      - Home/away splits group by was_home.
+    sql: |
+      SELECT player_full_name,
+             CASE WHEN was_home THEN 'home' ELSE 'away' END AS venue,
+             COUNT(*) AS matches,
+             SUM(points) AS points,
+             SUM(goals_scored) AS goals,
+             SUM(assists) AS assists,
+             ROUND(AVG(points), 2) AS points_per_match
+      FROM analytics.player_gameweek
+      WHERE player_id IN (306, 31)
+        AND season >= '2023-24'
+        AND minutes > 0
+      GROUP BY player_full_name, was_home
+      ORDER BY player_full_name, venue
+
+  - id: bruno-points-by-season
+    kind: answer
+    question: How many points has Bruno Fernandes scored each season?
+    players:
+      - {name: Bruno Fernandes, player_id: 387}
+    teaches:
+      - A first name and surname resolve even when FPL's full name has more in between ("Bruno Borges Fernandes").
+      - Per-season totals come from player_season, one row per season.
+    sql: |
+      SELECT season, team, points, goals, assists, minutes
+      FROM analytics.player_season
+      WHERE player_id = 387
+      ORDER BY season
+
+  - id: price-at-gameweek
+    kind: answer
+    question: What did Mohamed Salah cost at gameweek 10 of 2025-26, and at the end of that season?
+    players:
+      - {name: Mohamed Salah, player_id: 306}
+    teaches:
+      - '"At gameweek N" means price_as_of(player_id, that gameweek''s deadline).'
+      - A past price never comes from current_price.
+    sql: |
+      SELECT analytics.price_as_of(
+                 306,
+                 (SELECT MIN(gameweek_deadline)
+                  FROM analytics.player_gameweek
+                  WHERE season = '2025-26' AND gameweek = 10)
+             ) AS price_at_gw10,
+             (SELECT current_price
+              FROM analytics.player_season
+              WHERE player_id = 306 AND season = '2025-26') AS end_of_season_price
+
+  - id: underpriced-at-gameweek-5
+    kind: answer
+    question: Which players were underpriced at gameweek 5 relative to what they scored in the next five?
+    teaches:
+      - The price and the points come from different gameweeks. Reading both off one row is the natural mistake.
+      - The price a player played at is player_gameweek.price for that gameweek.
+    sql: |
+      WITH price_at_gw5 AS (
+          SELECT DISTINCT ON (player_id)
+                 player_id, player_name, position, team, price
+          FROM analytics.player_gameweek
+          WHERE season = '2025-26' AND gameweek = 5
+          ORDER BY player_id, kickoff_at
+      ),
+      next_five AS (
+          SELECT player_id,
+                 SUM(points) AS points_gw6_10,
+                 SUM(minutes) AS minutes_gw6_10
+          FROM analytics.player_gameweek
+          WHERE season = '2025-26' AND gameweek BETWEEN 6 AND 10
+          GROUP BY player_id
+      )
+      SELECT p.player_name, p.position, p.team,
+             p.price AS price_at_gw5,
+             n.points_gw6_10,
+             ROUND(n.points_gw6_10 / p.price, 2) AS points_per_million_gw6_10
+      FROM price_at_gw5 p
+      JOIN next_five n USING (player_id)
+      WHERE n.minutes_gw6_10 >= 200
+      ORDER BY points_per_million_gw6_10 DESC
+      LIMIT 10
+
+  - id: double-gameweeks
+    kind: answer
+    question: Which teams had double gameweeks last season?
+    teaches:
+      - A double gameweek is two team_fixture rows for one team in one gameweek.
+    sql: |
+      SELECT gameweek, team, COUNT(*) AS matches
+      FROM analytics.team_fixture
+      WHERE season = '2025-26'
+      GROUP BY gameweek, team
+      HAVING COUNT(*) = 2
+      ORDER BY gameweek, team
+
+  - id: price-changes
+    kind: answer
+    question: How did Mohamed Salah's price change over 2025-26?
+    players:
+      - {name: Mohamed Salah, player_id: 306}
+    teaches:
+      - Price history is a list of intervals; each row is a price and when it held.
+    sql: |
+      SELECT price, valid_from, valid_to
+      FROM analytics.player_price_history
+      WHERE player_id = 306 AND season = '2025-26'
+      ORDER BY valid_from
+
+  - id: ambiguous-player
+    kind: clarify
+    question: How many goals has Silva scored?
+    ambiguous_name: silva
+    teaches:
+      - When a name matches several players equally well, ask which one. Never pick the first.
+    response: >-
+      Several players are called Silva, including Marco Silva (Fulham) and
+      Adrien Silva (Leicester). Which one do you mean?
+
+  - id: goal-timing
+    kind: refuse
+    question: Which teams concede the most goals in the last fifteen minutes?
+    teaches:
+      - Minute-level goal timings are not in the data. Say so; do not answer a neighbouring question as if it were this one.
+    response: >-
+      The data records goals per match, not the minute they were scored, so
+      it cannot say when goals went in. I can show which teams concede the
+      most goals per match overall, which is a different question.
+    alternative_sql: |
+      SELECT team,
+             COUNT(*) AS matches,
+             SUM(goals_against) AS goals_conceded,
+             ROUND(AVG(goals_against), 2) AS conceded_per_match
+      FROM analytics.team_fixture
+      WHERE season = '2025-26' AND is_finished
+      GROUP BY team
+      ORDER BY conceded_per_match DESC
+      LIMIT 10
+
+  - id: captaincy
+    kind: refuse
+    question: Who did most managers captain last gameweek?
+    teaches:
+      - Manager-level data (captains, chips, teams, leagues) is not in the data.
+    response: >-
+      Captain picks are not in the data: it covers players and matches, not
+      what managers chose. I can show who scored the most points last
+      gameweek, if that helps.
+
+  - id: xg-before-2022
+    kind: refuse
+    question: What was Mohamed Salah's xG in 2019-20?
+    players:
+      - {name: Mohamed Salah, player_id: 306}
+    teaches:
+      - Expected stats start in 2022-23. Earlier seasons are NULL, which is "not recorded", not zero.
+    response: >-
+      Expected goals are only recorded from 2022-23 onwards, so there is no
+      xG for 2019-20. I can show Salah's goals and assists for that season,
+      or xG from 2022-23 on.

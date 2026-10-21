@@ -113,7 +113,7 @@ Client → API Gateway (usage plan, per-IP throttle)
        → Step Functions: clarify → retrieve → generate SQL
                         → validate → execute → summarise
        → Bedrock (Converse API) + Guardrails
-       → Knowledge Base: schema docs, glossary, few-shot examples
+       → pgvector: schema docs, glossary, few-shot examples (corpus/)
        → Postgres (read-only role) ← ingestion pipeline
        → DynamoDB: semantic cache, token budget, query log
 ```
@@ -315,7 +315,9 @@ environment.
 Input that a stranger typed reaches `analytics.find_player()` by design, so it is
 escaped with `analytics.like_literal()` and matched literally. It is never
 interpolated into a `LIKE` pattern or a regex, and results are capped. See
-`sql/008_search_hardening.sql` for what that fixed and why.
+`sql/008_search_hardening.sql` for what that fixed and why. The pipeline calls it
+to resolve names before generation; generated SQL cannot, because the validator
+refuses it, so deciding that "Silva" is ambiguous is code's job, not the model's.
 
 Known limitations, stated rather than implied away:
 

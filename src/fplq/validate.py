@@ -61,10 +61,13 @@ ALLOWED_SCHEMAS = frozenset({"analytics"})
 # else -- `pg_read_file`, `pg_sleep`, `dblink`, `set_config`, `query_to_xml`,
 # `lo_import` -- has to be named here to be callable. This list is therefore
 # the set of *our own* functions, and it is short by design.
+#
+# find_player is deliberately absent. Names are resolved by the pipeline before
+# generation, so code -- not the model -- decides when a name is ambiguous and
+# the user has to be asked. Generated SQL filters on the player_id it is given.
 ALLOWED_FUNCTIONS = frozenset(
     {
         "price_as_of",
-        "find_player",
         "player_search_text",
         "like_literal",
     }
