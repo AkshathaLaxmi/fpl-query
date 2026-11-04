@@ -152,8 +152,10 @@ class Hit:
     distance: float
 
 
-def search(conn: psycopg.Connection, embedder: Embedder, question: str, k: int = 6) -> list[Hit]:
-    """The k chunks nearest to the question, nearest first.
+def search(conn: psycopg.Connection, embedder: Embedder, question: str, k: int = 6,
+           kinds: tuple[str, ...] | None = None) -> list[Hit]:
+    """The k chunks nearest to the question, nearest first, optionally only
+    of the given kinds ('view', 'function', 'term', 'example').
 
     Refuses to compare across models: a vector from one embedding model is
     meaningless against another's, and nothing would announce the mismatch
@@ -172,9 +174,10 @@ def search(conn: psycopg.Connection, embedder: Embedder, question: str, k: int =
         """
         SELECT chunk_id, kind, content, embedding <=> %s::vector AS distance
         FROM retrieval.chunk
+        WHERE %s::text[] IS NULL OR kind = ANY(%s::text[])
         ORDER BY embedding <=> %s::vector
         LIMIT %s
         """,
-        (vector, vector, k),
+        (vector, list(kinds) if kinds else None, list(kinds) if kinds else None, vector, k),
     ).fetchall()
     return [Hit(r["chunk_id"], r["kind"], r["content"], float(r["distance"])) for r in rows]

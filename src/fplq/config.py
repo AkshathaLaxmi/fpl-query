@@ -124,6 +124,15 @@ class Settings:
         default_factory=lambda: _env("FPLQ_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")
     )
     embedding_dimensions: int = 1024
+    # The model behind both stages of `fplq ask`. Haiku by default: the golden
+    # set (FPL-17) decides whether Sonnet's accuracy is worth its cost. The
+    # au. profile keeps inference inside Australia; it is also the one this
+    # account is enabled for.
+    chat_model: str = field(
+        default_factory=lambda: _env(
+            "FPLQ_CHAT_MODEL", "au.anthropic.claude-haiku-4-5-20251001-v1:0"
+        )
+    )
 
 
 settings = Settings()
