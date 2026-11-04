@@ -69,4 +69,6 @@ sudo apt install postgresql-17-pgvector
 ```
 
 The Docker image `pgvector/pgvector:pg17` ships with it preinstalled.
-`CREATE EXTENSION vector` arrives with the retrieval corpus migration (FPL-9).
+`fplq bootstrap` creates the extension (it needs a superuser), and
+`sql/011_retrieval.sql` creates the `retrieval` schema. `fplq index` embeds the
+corpus with Titan Text Embeddings v2 and keeps the index in step with it.

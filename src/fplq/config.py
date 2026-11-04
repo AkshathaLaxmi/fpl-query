@@ -110,6 +110,21 @@ class Settings:
         default_factory=lambda: REPO_ROOT / "data" / "overrides" / "player_aliases.yaml"
     )
 
+    # --- Bedrock ----------------------------------------------------------
+    # The account's home region. Bedrock inference creates no resources, so
+    # it could be called anywhere, but keeping it here keeps the corpus and
+    # the questions inside one region's data boundary.
+    bedrock_region: str = field(
+        default_factory=lambda: _env("FPLQ_BEDROCK_REGION", "ap-southeast-2")
+    )
+    # Changing the model or the dimensions invalidates every stored vector:
+    # `fplq index` re-embeds any chunk whose model differs, and the column
+    # width in sql/011_retrieval.sql must match the dimensions.
+    embedding_model: str = field(
+        default_factory=lambda: _env("FPLQ_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")
+    )
+    embedding_dimensions: int = 1024
+
 
 settings = Settings()
 
