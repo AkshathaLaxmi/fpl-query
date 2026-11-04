@@ -271,8 +271,17 @@ Once a season is loaded, keep the current one fresh from the live API:
 
 ```bash
 fplq ingest                   # today's prices, ownership and match results
+fplq ingest-stats             # per-player match stats for the current season
 fplq replay --batch-id 12     # re-run a past ingest's transform, no re-fetch
 ```
+
+`fplq ingest-stats` fills the current season's player-match rows from the API
+while the archive mirror lags behind. It makes one request per player (about
+670, at one a second), so it belongs after each gameweek rather than daily;
+run `fplq ingest` first. The archive still owns history: when it catches up,
+an archive load overwrites the live rows, and a live run never overwrites an
+archive row (`sql/012_stat_source.sql`). It exits non-zero if it writes
+nothing, or if any finished match is left without player rows.
 
 `fplq ingest` is meant to run on a schedule (cron, a Lambda, whatever is
 convenient) rather than by hand every day. It exits non-zero if it writes zero

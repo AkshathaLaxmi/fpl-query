@@ -50,9 +50,11 @@ import psycopg
 
 from fplq.config import CURRENT_SEASON, ConfigError, Settings
 from fplq.config import settings as default_settings
+from fplq.ingest.archive import parse_gameweek_row
 from fplq.ingest.fpl_api import FplApiClient
 from fplq.resolve.names import name_key
 from fplq.resolve.players import PlayerResolver, load_overrides
+from fplq.transform.loader import SeasonLoader, upsert_player_fixture_stat
 
 log = logging.getLogger(__name__)
 
@@ -176,6 +178,37 @@ class LiveIngestReport:
         )
 
 
+@dataclass
+class MatchStatsReport:
+    season: str
+    batch_id: int | None = None
+    players_fetched: int = 0
+    rows_written: int = 0
+    rows_archive_owned: int = 0
+    unmatched: list[str] = field(default_factory=list)
+    # Finished fixtures that still have no player rows after the run. Should
+    # be empty: a finished match always has at least 22 players in it.
+    fixtures_missing_stats: list[int] = field(default_factory=list)
+
+    def summary(self) -> str:
+        return (
+            f"{self.season}: {self.players_fetched} players fetched, "
+            f"{self.rows_written} player-match rows written, "
+            f"{self.rows_archive_owned} left to the archive, {len(self.unmatched)} unmatched, "
+            f"{len(self.fixtures_missing_stats)} finished fixtures without player rows"
+        )
+
+
+def _as_archive_row(history_row: dict[str, Any]) -> dict[str, str]:
+    """An element-summary history row in the shape archive.parse_gameweek_row
+    reads. The archive's merged_gw.csv is built from these same API rows, so
+    the field names already match; only the values differ, JSON types where
+    the parser expects CSV text. Converting here, rather than writing a second
+    parser, is what keeps an archive row and a live row for the same match
+    identical."""
+    return {key: "" if value is None else str(value) for key, value in history_row.items()}
+
+
 class LiveLoader:
     """Fetches (or replays) a live snapshot and refreshes the current season."""
 
@@ -202,8 +235,10 @@ class LiveLoader:
     def _close_batch(self, batch_id: int, *, row_count: int,
                      status: str = "succeeded", error: str | None = None) -> None:
         with self.conn.cursor() as cur:
+            # clock_timestamp(), not now(): now() is the transaction's start time,
+            # so every batch recorded a duration of zero.
             cur.execute(
-                "UPDATE raw.ingest_batch SET status=%s, completed_at=now(), "
+                "UPDATE raw.ingest_batch SET status=%s, completed_at=clock_timestamp(), "
                 "row_count=%s, error=%s WHERE batch_id=%s",
                 (status, row_count, error, batch_id),
             )
@@ -565,6 +600,133 @@ class LiveLoader:
                 )
                 report.fixtures_refreshed += 1
 
+    # -- player-match stats (element-summary) --------------------------------
+
+    def _season_maps(self, season_id: int) -> dict[str, dict[int, int]]:
+        """FPL's per-season ids -> ours, from what `fplq ingest` (or the
+        archive) has already registered. Stats never register anything."""
+        queries = {
+            "element": "SELECT fpl_element_id AS k, player_id AS v FROM core.player_season "
+                       "WHERE season_id=%s AND fpl_element_id IS NOT NULL",
+            "fixture": "SELECT fpl_fixture_id AS k, fixture_id AS v FROM core.fixture "
+                       "WHERE season_id=%s AND fpl_fixture_id IS NOT NULL",
+            "team": "SELECT fpl_team_id AS k, team_id AS v FROM core.team_season WHERE season_id=%s",
+            "gameweek": "SELECT gameweek_number AS k, gameweek_id AS v FROM core.gameweek "
+                        "WHERE season_id=%s",
+        }
+        maps = {}
+        with self.conn.cursor() as cur:
+            for name, sql in queries.items():
+                cur.execute(sql, (season_id,))
+                maps[name] = {int(r["k"]): r["v"] for r in cur.fetchall()}
+        return maps
+
+    def _apply_match_stats(self, season_id: int, season: str, history: list[dict[str, Any]],
+                           report: MatchStatsReport) -> None:
+        maps = self._season_maps(season_id)
+        chosen: dict[tuple[int, int], dict[str, Any]] = {}
+        with self.conn.cursor() as cur:
+            for raw in history:
+                row = parse_gameweek_row(_as_archive_row(raw))
+                player_id = maps["element"].get(row["fpl_element_id"] or -1)
+                fixture_id = maps["fixture"].get(row["fpl_fixture_id"] or -1)
+                if player_id is None or fixture_id is None:
+                    detail = f"element={row['fpl_element_id']} fixture={row['fpl_fixture_id']}"
+                    self._record_issue(cur, "missing_fixture" if player_id else "unmatched_player",
+                                       season, detail)
+                    report.unmatched.append(detail)
+                    continue
+                # The API does not repeat a (player, fixture) pair the way the
+                # archive file can; if it ever did, the later row wins.
+                chosen[(player_id, fixture_id)] = row
+
+            for (player_id, fixture_id), row in chosen.items():
+                opponent = row["opponent_fpl_team_id"]
+                written = upsert_player_fixture_stat(
+                    cur, row, player_id=player_id, season_id=season_id,
+                    gameweek_id=maps["gameweek"].get(row["gameweek_number"] or -1),
+                    fixture_id=fixture_id,
+                    team_id=SeasonLoader._team_from_fixture(cur, fixture_id, row["was_home"]),
+                    opponent_team_id=maps["team"].get(opponent) if opponent else None,
+                    position_id=SeasonLoader._season_position(cur, player_id, season_id),
+                    source="fpl_api",
+                )
+                if written:
+                    report.rows_written += 1
+                else:
+                    report.rows_archive_owned += 1
+
+    def _finished_fixtures_without_stats(self, season_id: int) -> list[int]:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT f.fpl_fixture_id
+                FROM core.fixture f
+                WHERE f.season_id = %s AND f.is_finished
+                  AND NOT EXISTS (SELECT 1 FROM core.player_fixture_stat s
+                                  WHERE s.fixture_id = f.fixture_id)
+                ORDER BY f.fpl_fixture_id
+                """,
+                (season_id,),
+            )
+            return [r["fpl_fixture_id"] for r in cur.fetchall()]
+
+    def ingest_match_stats(self, season: str = CURRENT_SEASON) -> MatchStatsReport:
+        """Fetch every current player's element-summary and write their
+        per-match rows for `season`.
+
+        One request per player -- about 670, at the client's self-imposed
+        rate of one a second -- so this is a once-per-gameweek job, not the
+        daily `ingest`. Run `ingest` first: it registers the season's players
+        and fixtures, which this only reads.
+        """
+        season_id = self._season_id(season)
+        report = MatchStatsReport(season=season)
+        elements = sorted(self._season_maps(season_id)["element"])
+        if not elements:
+            raise ValueError(f"no players registered for {season}; run `fplq ingest` first")
+
+        batch_id = self._open_batch("element_summary", season)
+        report.batch_id = batch_id
+        try:
+            history: list[dict[str, Any]] = []
+            with FplApiClient(self.settings) as client:
+                for element_id in elements:
+                    result = client.element_summary(element_id)
+                    rows = result.payload.get("history", [])
+                    # Landed untouched, keyed by fixture; each row carries its
+                    # own element id, so (element, fixture) is recoverable.
+                    self._land(batch_id, "element_history", rows, "fixture", result.fetched_at)
+                    history.extend(rows)
+                    report.players_fetched += 1
+
+            self._apply_match_stats(season_id, season, history, report)
+            report.fixtures_missing_stats = self._finished_fixtures_without_stats(season_id)
+            self._close_batch(batch_id, row_count=report.rows_written)
+            self.conn.commit()
+        except Exception as exc:
+            self.conn.rollback()
+            self._close_batch(batch_id, row_count=0, status="failed", error=str(exc)[:2000])
+            self.conn.commit()
+            raise
+
+        log.info(report.summary())
+        return report
+
+    def replay_match_stats(self, batch_id: int, season: str) -> MatchStatsReport:
+        history = self._documents(batch_id, "element_history")
+        if not history:
+            raise ValueError(f"batch {batch_id} has no landed element history to replay")
+        report = MatchStatsReport(season=season, batch_id=batch_id)
+        try:
+            self._apply_match_stats(self._season_id(season), season, history, report)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        log.info("replayed batch %s: %s", batch_id, report.summary())
+        return report
+
     # -- orchestration ---------------------------------------------------------
 
     def _apply(self, season_id: int, season: str, elements: list[dict[str, Any]],
@@ -624,7 +786,7 @@ class LiveLoader:
         """
         with self.conn.cursor() as cur:
             cur.execute(
-                "SELECT season FROM raw.ingest_batch WHERE batch_id=%s",
+                "SELECT season, endpoint FROM raw.ingest_batch WHERE batch_id=%s",
                 (batch_id,),
             )
             batch = cur.fetchone()
@@ -632,6 +794,8 @@ class LiveLoader:
             raise ValueError(f"no ingest batch {batch_id}")
 
         season = batch["season"]
+        if batch["endpoint"] == "element_summary":
+            return self.replay_match_stats(batch_id, season)
         season_id = self._season_id(season)
         elements = self._documents(batch_id, "element")
         teams = self._documents(batch_id, "team")
@@ -661,3 +825,8 @@ def ingest_live(conn: psycopg.Connection, season: str = CURRENT_SEASON,
 def replay_batch(conn: psycopg.Connection, batch_id: int,
                  settings: Settings = default_settings) -> LiveIngestReport:
     return LiveLoader(conn, settings).replay(batch_id)
+
+
+def ingest_match_stats(conn: psycopg.Connection, season: str = CURRENT_SEASON,
+                       settings: Settings = default_settings) -> MatchStatsReport:
+    return LiveLoader(conn, settings).ingest_match_stats(season)

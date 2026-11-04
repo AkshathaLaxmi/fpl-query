@@ -48,6 +48,60 @@ from fplq.resolve.players import PlayerResolver, load_overrides
 log = logging.getLogger(__name__)
 
 
+# The columns of core.player_fixture_stat that come straight from a parsed
+# gameweek row (archive.parse_gameweek_row). The archive and the live API's
+# element-summary history share the parser, so they share this list too.
+STAT_ROW_COLUMNS = (
+    "was_home", "kickoff_at",
+    "minutes", "starts", "total_points", "goals_scored", "assists",
+    "clean_sheets", "goals_conceded", "own_goals", "penalties_saved",
+    "penalties_missed", "yellow_cards", "red_cards", "saves", "bonus", "bps",
+    "influence", "creativity", "threat", "ict_index",
+    "expected_goals", "expected_assists", "expected_goal_involvements",
+    "expected_goals_conceded", "expected_points",
+    "tackles", "recoveries", "clearances_blocks_interceptions",
+    "defensive_contribution",
+    "price_at_deadline", "selected_at_deadline", "transfers_in", "transfers_out",
+)
+_ID_COLUMNS = ("player_id", "season_id", "gameweek_id", "fixture_id", "team_id",
+               "opponent_team_id", "position_id")
+
+
+def _stat_upsert_sql(source: str) -> str:
+    columns = (*_ID_COLUMNS, *STAT_ROW_COLUMNS, "source")
+    updated = [c for c in columns if c not in ("player_id", "fixture_id")]
+    sql = (
+        f"INSERT INTO core.player_fixture_stat ({', '.join(columns)}) "
+        f"VALUES ({', '.join(['%s'] * len(columns))}) "
+        # Every non-key column, so a reload replaces a row outright. Updating a
+        # subset is how a hybrid row, once written, survives every later reload.
+        f"ON CONFLICT (player_id, fixture_id) DO UPDATE SET "
+        + ", ".join(f"{c} = EXCLUDED.{c}" for c in updated)
+    )
+    if source == "fpl_api":
+        # Live fills the gap and refreshes its own rows; it never overwrites a
+        # row the archive wrote (see sql/012_stat_source.sql).
+        sql += " WHERE core.player_fixture_stat.source = 'fpl_api'"
+    return sql
+
+
+_STAT_UPSERT = {source: _stat_upsert_sql(source) for source in ("fpl_archive", "fpl_api")}
+
+
+def upsert_player_fixture_stat(cur: psycopg.Cursor, row: dict[str, Any], *, player_id: int,
+                               season_id: int, gameweek_id: int | None, fixture_id: int,
+                               team_id: int | None, opponent_team_id: int | None,
+                               position_id: int | None, source: str) -> bool:
+    """Write one player-match row. Returns False if a live write was skipped
+    because the archive already owns that row."""
+    cur.execute(
+        _STAT_UPSERT[source],
+        (player_id, season_id, gameweek_id, fixture_id, team_id, opponent_team_id,
+         position_id, *(row[c] for c in STAT_ROW_COLUMNS), source),
+    )
+    return cur.rowcount == 1
+
+
 @dataclass
 class LoadReport:
     season: str
@@ -108,8 +162,10 @@ class SeasonLoader:
     def _close_batch(self, batch_id: int, *, status: str = "succeeded",
                      error: str | None = None) -> None:
         with self.conn.cursor() as cur:
+            # clock_timestamp(), not now(): now() is the transaction's start time,
+            # so every batch recorded a duration of zero.
             cur.execute(
-                "UPDATE raw.ingest_batch SET status=%s, completed_at=now(), error=%s "
+                "UPDATE raw.ingest_batch SET status=%s, completed_at=clock_timestamp(), error=%s "
                 "WHERE batch_id=%s",
                 (status, error, batch_id),
             )
@@ -512,88 +568,11 @@ class SeasonLoader:
                 position_id = position_by_code.get((row["position_code"] or "").upper()) \
                     or self._season_position(cur, player_id, season_id)
 
-                cur.execute(
-                    """
-                    INSERT INTO core.player_fixture_stat (
-                        player_id, season_id, gameweek_id, fixture_id, team_id,
-                        opponent_team_id, position_id, was_home, kickoff_at,
-                        minutes, starts, total_points, goals_scored, assists,
-                        clean_sheets, goals_conceded, own_goals, penalties_saved,
-                        penalties_missed, yellow_cards, red_cards, saves, bonus, bps,
-                        influence, creativity, threat, ict_index,
-                        expected_goals, expected_assists, expected_goal_involvements,
-                        expected_goals_conceded, expected_points,
-                        tackles, recoveries, clearances_blocks_interceptions,
-                        defensive_contribution,
-                        price_at_deadline, selected_at_deadline,
-                        transfers_in, transfers_out)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s,
-                            %s, %s, %s, %s)
-                    ON CONFLICT (player_id, fixture_id) DO UPDATE SET
-                        -- Every non-key column, so a reload replaces a row
-                        -- outright. Updating a subset is how a hybrid row,
-                        -- once written, survives every later reload.
-                        season_id = EXCLUDED.season_id,
-                        gameweek_id = EXCLUDED.gameweek_id,
-                        team_id = EXCLUDED.team_id,
-                        opponent_team_id = EXCLUDED.opponent_team_id,
-                        position_id = EXCLUDED.position_id,
-                        was_home = EXCLUDED.was_home,
-                        kickoff_at = EXCLUDED.kickoff_at,
-                        minutes = EXCLUDED.minutes,
-                        starts = EXCLUDED.starts,
-                        total_points = EXCLUDED.total_points,
-                        goals_scored = EXCLUDED.goals_scored,
-                        assists = EXCLUDED.assists,
-                        clean_sheets = EXCLUDED.clean_sheets,
-                        goals_conceded = EXCLUDED.goals_conceded,
-                        own_goals = EXCLUDED.own_goals,
-                        penalties_saved = EXCLUDED.penalties_saved,
-                        penalties_missed = EXCLUDED.penalties_missed,
-                        yellow_cards = EXCLUDED.yellow_cards,
-                        red_cards = EXCLUDED.red_cards,
-                        saves = EXCLUDED.saves,
-                        bonus = EXCLUDED.bonus,
-                        bps = EXCLUDED.bps,
-                        influence = EXCLUDED.influence,
-                        creativity = EXCLUDED.creativity,
-                        threat = EXCLUDED.threat,
-                        ict_index = EXCLUDED.ict_index,
-                        expected_goals = EXCLUDED.expected_goals,
-                        expected_assists = EXCLUDED.expected_assists,
-                        expected_goal_involvements = EXCLUDED.expected_goal_involvements,
-                        expected_goals_conceded = EXCLUDED.expected_goals_conceded,
-                        expected_points = EXCLUDED.expected_points,
-                        tackles = EXCLUDED.tackles,
-                        recoveries = EXCLUDED.recoveries,
-                        clearances_blocks_interceptions =
-                            EXCLUDED.clearances_blocks_interceptions,
-                        defensive_contribution = EXCLUDED.defensive_contribution,
-                        price_at_deadline = EXCLUDED.price_at_deadline,
-                        selected_at_deadline = EXCLUDED.selected_at_deadline,
-                        transfers_in = EXCLUDED.transfers_in,
-                        transfers_out = EXCLUDED.transfers_out
-                    """,
-                    (player_id, season_id, gameweek_map.get(gw), fixture_id, team_id,
-                     opponent_id, position_id, row["was_home"], row["kickoff_at"],
-                     row["minutes"], row["starts"], row["total_points"],
-                     row["goals_scored"], row["assists"], row["clean_sheets"],
-                     row["goals_conceded"], row["own_goals"], row["penalties_saved"],
-                     row["penalties_missed"], row["yellow_cards"], row["red_cards"],
-                     row["saves"], row["bonus"], row["bps"],
-                     row["influence"], row["creativity"], row["threat"], row["ict_index"],
-                     row["expected_goals"], row["expected_assists"],
-                     row["expected_goal_involvements"], row["expected_goals_conceded"],
-                     row["expected_points"],
-                     row["tackles"], row["recoveries"],
-                     row["clearances_blocks_interceptions"], row["defensive_contribution"],
-                     row["price_at_deadline"], row["selected_at_deadline"],
-                     row["transfers_in"], row["transfers_out"]),
+                upsert_player_fixture_stat(
+                    cur, row, player_id=player_id, season_id=season_id,
+                    gameweek_id=gameweek_map.get(gw), fixture_id=fixture_id,
+                    team_id=team_id, opponent_team_id=opponent_id,
+                    position_id=position_id, source="fpl_archive",
                 )
                 report.stats += 1
 
