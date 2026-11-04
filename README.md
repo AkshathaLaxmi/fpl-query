@@ -170,8 +170,9 @@ Claiming finer resolution than the source has would be inventing precision.
 
 ## Getting started
 
-Requires Python 3.11+ and PostgreSQL 14+ (`btree_gist` is used for the
-exclusion constraint).
+Requires Python 3.11+ and PostgreSQL 14+ with
+[pgvector](https://github.com/pgvector/pgvector) 0.8+ (`btree_gist` is used for
+the exclusion constraint, pgvector for the retrieval corpus).
 
 ### Postgres, if you do not already have it
 
@@ -182,7 +183,7 @@ roles this project creates.
 **macOS, Homebrew:**
 
 ```bash
-brew install postgresql@17
+brew install postgresql@17 pgvector
 brew services start postgresql@17
 # The versioned formula is keg-only, so its binaries are not on PATH until
 # you say so -- without this, psql and pg_isready stay "command not found"
@@ -202,6 +203,7 @@ then add its `bin` directory to `PATH` from Preferences → Command Line Tools.
 
 ```bash
 sudo apt install postgresql postgresql-contrib
+sudo apt install postgresql-17-pgvector   # match your Postgres major version
 sudo systemctl start postgresql
 ```
 
@@ -210,8 +212,9 @@ sudo systemctl start postgresql
 ```bash
 # Pick your own password here -- postgres:postgres is a known default that
 # credential-scanning bots try first against any exposed port.
+# Postgres 17 with pgvector preinstalled, from the pgvector project.
 docker run -d --name fplq-pg -p 5432:5432 \
-    -e POSTGRES_PASSWORD=change-me postgres:17
+    -e POSTGRES_PASSWORD=change-me pgvector/pgvector:pg17
 ```
 
 Check it is up with `pg_isready` before going further.
@@ -275,6 +278,15 @@ fplq replay --batch-id 12     # re-run a past ingest's transform, no re-fetch
 convenient) rather than by hand every day. It exits non-zero if it writes zero
 rows — the quiet failure that a scheduler should alert on, since nothing else
 about that run looks wrong.
+
+The retrieval corpus (`corpus/*.yaml`) is embedded with Amazon Titan Text
+Embeddings v2 on Bedrock, so this step needs AWS credentials (`aws login`
+works) and `pip install -e ".[aws]"`:
+
+```bash
+fplq index                    # embed new or changed chunks; a no-op if nothing changed
+fplq retrieve "cheap defenders with easy fixtures"   # the nearest chunks, to sanity-check
+```
 
 ```bash
 pytest -m "not database and not network"   # fast: parsing, resolution, the validator

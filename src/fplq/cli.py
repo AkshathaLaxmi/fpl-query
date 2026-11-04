@@ -6,6 +6,8 @@
     fplq replay --batch-id 12      re-run a past live ingest from raw.document, no fetch
     fplq issues                    list unresolved identity problems
     fplq stats                     row counts, so a load can be sanity-checked
+    fplq index                     embed the retrieval corpus into pgvector (Bedrock)
+    fplq retrieve "question"       show the corpus chunks nearest to a question
 """
 
 from __future__ import annotations
@@ -125,6 +127,10 @@ def _bootstrap(_: argparse.Namespace) -> int:
     admin_params["dbname"] = settings.database_name
     with psycopg.connect(make_conninfo(**admin_params), autocommit=True) as conn, conn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS btree_gist")
+        # pgvector, for the retrieval corpus (sql/011_retrieval.sql). Created
+        # here for the same reason as btree_gist: an extension needs a
+        # superuser, and migrations run as the writer.
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
     # Migrations run as the writer, which owns the database and therefore the
     # schemas. That ownership is what makes the analytics views work for the
@@ -203,6 +209,28 @@ def _replay(args: argparse.Namespace) -> int:
     return 0
 
 
+def _index(_: argparse.Namespace) -> int:
+    from fplq.db import connect
+    from fplq.retrieval import TitanEmbedder, index
+
+    with connect(require_dsn(settings.writer_dsn, "FPLQ_WRITER_DSN")) as conn:
+        report = index(conn, TitanEmbedder())
+    print(report.summary())
+    return 0
+
+
+def _retrieve(args: argparse.Namespace) -> int:
+    from fplq.db import connect
+    from fplq.retrieval import TitanEmbedder, search
+
+    with connect(require_dsn(settings.writer_dsn, "FPLQ_WRITER_DSN")) as conn:
+        hits = search(conn, TitanEmbedder(), args.question, k=args.k)
+    for hit in hits:
+        first_line = hit.content.splitlines()[0]
+        print(f"{hit.distance:.3f}  {hit.chunk_id:<45}  {first_line[:70]}")
+    return 0
+
+
 def _issues(args: argparse.Namespace) -> int:
     from fplq.db import query
 
@@ -277,6 +305,13 @@ def main(argv: list[str] | None = None) -> int:
     issues.set_defaults(fn=_issues)
 
     sub.add_parser("stats", help="row counts per table").set_defaults(fn=_stats)
+
+    sub.add_parser("index", help="embed the retrieval corpus into pgvector").set_defaults(fn=_index)
+
+    retrieve = sub.add_parser("retrieve", help="show the corpus chunks nearest to a question")
+    retrieve.add_argument("question")
+    retrieve.add_argument("-k", type=int, default=6)
+    retrieve.set_defaults(fn=_retrieve)
 
     args = parser.parse_args(argv)
     logging.basicConfig(
