@@ -8,6 +8,7 @@
     fplq stats                     row counts, so a load can be sanity-checked
     fplq index                     embed the retrieval corpus into pgvector (Bedrock)
     fplq retrieve "question"       show the corpus chunks nearest to a question
+    fplq ask "question"            answer a question: SQL generated on Bedrock, validated, run
 """
 
 from __future__ import annotations
@@ -231,6 +232,44 @@ def _retrieve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ask(args: argparse.Namespace) -> int:
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    from fplq.ask import ask
+    from fplq.db import connect
+    from fplq.llm import BedrockChat
+    from fplq.retrieval import TitanEmbedder
+    from fplq.validate import reader_connection
+
+    try:
+        with connect(require_dsn(settings.writer_dsn, "FPLQ_WRITER_DSN")) as writer, \
+                reader_connection() as reader:
+            answer = ask(args.question, chat=BedrockChat(model=args.model),
+                         embedder=TitanEmbedder(), writer=writer, reader=reader)
+    except (BotoCoreError, ClientError) as err:
+        # Bedrock unreachable, throttled past the retries, or access denied:
+        # nothing about the question, so say what failed and stop.
+        print(f"Bedrock call failed: {err}", file=sys.stderr)
+        return 1
+
+    if answer.kind != "answer":
+        print(f"[{answer.kind}] {answer.message}")
+    else:
+        print(answer.explanation, end="\n\n")
+        print(answer.sql, end="\n\n")
+        widths = [max(len(str(c)), *(len(str(r[i])) for r in answer.rows[:args.rows]))
+                  for i, c in enumerate(answer.columns)]
+        print("  ".join(str(c).ljust(w) for c, w in zip(answer.columns, widths, strict=True)))
+        for row in answer.rows[:args.rows]:
+            print("  ".join(str(v).ljust(w) for v, w in zip(row, widths, strict=True)))
+        if len(answer.rows) > args.rows:
+            print(f"... {len(answer.rows) - args.rows} more")
+    tokens_in, tokens_out = answer.trace.tokens
+    print(f"\n({len(answer.trace.calls)} model call(s), {tokens_in} in / {tokens_out} out tokens, "
+          f"{answer.elapsed_ms} ms)")
+    return 0 if answer.kind in ("answer", "clarify", "refuse") else 1
+
+
 def _issues(args: argparse.Namespace) -> int:
     from fplq.db import query
 
@@ -312,6 +351,12 @@ def main(argv: list[str] | None = None) -> int:
     retrieve.add_argument("question")
     retrieve.add_argument("-k", type=int, default=6)
     retrieve.set_defaults(fn=_retrieve)
+
+    ask = sub.add_parser("ask", help="answer a question in plain English")
+    ask.add_argument("question")
+    ask.add_argument("--model", help=f"Bedrock model or profile id (default {settings.chat_model})")
+    ask.add_argument("--rows", type=int, default=20, help="rows to print")
+    ask.set_defaults(fn=_ask)
 
     args = parser.parse_args(argv)
     logging.basicConfig(
