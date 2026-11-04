@@ -3,6 +3,7 @@
     fplq bootstrap                 create the database, roles and schema
     fplq load --seasons 2024-25    fetch and load seasons from the archive
     fplq ingest                    fetch a live snapshot and refresh the current season
+    fplq ingest-stats              fetch this season's player-match stats (after each gameweek)
     fplq replay --batch-id 12      re-run a past live ingest from raw.document, no fetch
     fplq issues                    list unresolved identity problems
     fplq stats                     row counts, so a load can be sanity-checked
@@ -200,6 +201,21 @@ def _ingest(args: argparse.Namespace) -> int:
     return 1 if report.rows_written == 0 else 0
 
 
+def _ingest_stats(args: argparse.Namespace) -> int:
+    from fplq.db import connect
+    from fplq.transform.live import ingest_match_stats
+
+    with connect(require_dsn(settings.writer_dsn, "FPLQ_WRITER_DSN")) as conn:
+        report = ingest_match_stats(conn, args.season)
+    print(report.summary())
+    # Two quiet failures, both of which otherwise look like success: nothing
+    # came back at all, or a finished match still has no player rows. Zero
+    # written because the archive now owns every row is the archive catching
+    # up, which is fine.
+    nothing = report.rows_written + report.rows_archive_owned == 0
+    return 1 if nothing or report.fixtures_missing_stats else 0
+
+
 def _replay(args: argparse.Namespace) -> int:
     from fplq.db import connect
     from fplq.transform.live import replay_batch
@@ -334,6 +350,11 @@ def main(argv: list[str] | None = None) -> int:
     ingest = sub.add_parser("ingest", help="fetch a live snapshot and refresh the current season")
     ingest.add_argument("--season", default=CURRENT_SEASON)
     ingest.set_defaults(fn=_ingest)
+
+    stats = sub.add_parser("ingest-stats",
+                           help="fetch the current season's player-match stats (element-summary)")
+    stats.add_argument("--season", default=CURRENT_SEASON)
+    stats.set_defaults(fn=_ingest_stats)
 
     replay = sub.add_parser("replay", help="re-run a past live ingest from raw.document")
     replay.add_argument("--batch-id", type=int, required=True)

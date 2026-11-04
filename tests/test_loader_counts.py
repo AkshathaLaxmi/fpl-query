@@ -40,6 +40,8 @@ class _FakeCursor:
     def __exit__(self, *exc: object) -> None:
         return None
 
+    rowcount = 1  # every write "lands", as a real cursor reports after an upsert
+
     def execute(self, sql: str, params: object = None) -> None:
         self.log.append((sql, params))
         self._last = sql
